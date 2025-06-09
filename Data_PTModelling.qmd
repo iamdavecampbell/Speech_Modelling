@@ -87,6 +87,8 @@ if(prefix == "log"){
           main = topic_of_interest, 
           ylab = "Log Topic Proportion",
           xlab = "date")
+}else{
+  data         = data_full$data
 }
 
 ```
