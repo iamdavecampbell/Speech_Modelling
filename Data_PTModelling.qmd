@@ -1,0 +1,374 @@
+---
+title: "Data_PTModelling"
+format: 
+  html:
+    html-math-method: mathjax
+    echo: true
+    eval: false
+---
+
+
+
+
+## Basics
+
+Note, when running as a script, we can define **niter**, **nstops**, and the saving **filename** externally.
+Defaults, if not provided are: niter = 50000;nstops = 100; filename = "realdata_interim_results2.Rdata"
+
+```{r version}
+#| code-fold: true
+version
+library(tidyverse)
+library(lubridate)
+library(truncnorm)
+library(mvtnorm)
+# import main functions
+source("MCMC_functions.R")
+```
+
+
+
+## User Defined Options
+
+Note that there are some switches that a user may define here.  In this code block the user defines:
+
+1. the location and file containing the time series of topics.
+2. the topic of interest
+3. the countries to use
+4. The first month to use.
+5. deciding if the log or raw data should be used.   Probably go for the log version.
+
+```{r user_defined_options}
+# 1. location and filename
+datafolder = "cbspeeches-main/inst/data-misc/"
+datafile   = paste0(datafolder,"nmf-time-series-g20.csv")
+
+#2. topic of interest
+candidate_topics = c("inflat" ,"brexit", "covid", "cbdc", "ukrain" )
+(topic_of_interest = candidate_topics[1])
+
+#3 countries to use.  
+# possible option
+G7_countries = c ("Canada", "France", "Germany", "Italy", "Japan",  "United Kingdom","United States")
+# possible option
+CUSA = c ("Canada","United States")
+# actual decision:
+countries2use = G7_countries# unique(dataset$country)
+
+#4 first month to use
+start_date = ymd("2008-11-01")
+
+#5 decision to log (or not log) the dataset.  Note that the data is transformed and the "prefix" is 
+prefix = "log"   # since using log transformed data.
+# prefix = "raw" # if not using log transformed data.
+
+```
+
+
+
+
+## Data Loading
+
+
+```{r dataload}
+
+
+#. just loading and maybe transforming the data:
+data_full = dataload(datafile, topic_of_interest, countries2use, start_date)
+dates_in_use = data_full$dates_in_use
+matplot(x = dates_in_use,y=data_full$data, type="l", 
+        main = topic_of_interest, 
+        ylab = "Topic Proportion",
+        xlab = "date")
+
+if(prefix == "log"){
+  data         = log(data_full$data)
+  matplot(x = dates_in_use,y=data, type="l", 
+          main = topic_of_interest, 
+          ylab = "Log Topic Proportion",
+          xlab = "date")
+}
+
+```
+##### Problem when using log values:
+
+There are some hard zeros in the data file.  When taking a log, this is a problem since they become -Infinity.  **Warning**: This needs more thought and may be worth revisiting.  For now I could replace the -Infinity values with half the minimum observed value.  The alternative is to treat the actual zeros as unobserved and replace them with NAs.  I believe that replacement with finite value is better.  I could include a data transformation in the likelihood, but I don't expect the results to differ in a meaningful way.
+```{r}
+#| code-fold: true
+
+# log version removing the infinite values:
+tmp = data[!is.na(data)]; tmp = tmp[!is.infinite(tmp)]; summary(tmp)
+# observed raw data values, removing the hard zeros:
+tmp = data_full$data[!is.na(data_full$data)]; tmp = tmp[tmp!=0]; summary(tmp)
+
+# Injecting a fix:
+if(prefix == "log"){
+  data[is.infinite(data)] = log(min(tmp)/2)
+}
+
+```
+
+
+## The Model 
+
+We model the topic proportion for topic **i**, from country **j** at time **t**, $DTP_{ijt}$, as a function of lagged information, $DTP_{ijt-1}$, information from countries other than country $j\in 1,...,J$, $DTP_{i(-j)t-1}$, and exogenous variables, $X_{i,j,t}$,
+
+<!-- $$DTP_{ijt} = a + b * DTP_{ijt-1} + c * DTP_{i(-j)t-1}   + d * X_{i,j,t} + f * Country \times Month_{j,t} + e$$ -->
+$$DTP_{ijt} = a_j + \sum_pb_{jp} * DTP_{ijt-p} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * DTP_{ikt-1}     + e_{i,j,t}, \ \ \ where\ \ \ e\sim N(0,\sigma^2_{i}).\label{eq:dtpijt}$$
+Where we drop the dependence on $i$ when it is not ambiguous.  For simplicity of notation consider only lag $p=1$, but note that extensions are straight forward.  
+
+
+The model coefficients include the $J$ intercepts, $a=[a_1,...,a_J]$, the $J*P$ slopes for each country and lag combination $b=[b_{1,1},...,b_{j,p},...,b_{JP}]$, the $J*(J-1)$ coefficients connecting country $j$ to all other countries $[c_{1,2},...,c_{j,k},...,c_{J,J-1}]$,  the residual variance $\sigma^2$, and the initial condition for the model $DTP_0 = [DTP_{10},...,DTP_{J0}$. The nuissance parameters are the unobserved $DTP^*_{jt}$.  We could write this in matrix form by defining the parameter matrix by concatenating $\Theta = [a,b,c]$ and similarly putting together all the pieces from this time stamp into $X_{jt}=DTP_{jt}$ giving the model:
+
+$$X_{t} = \theta X_{t-1}+ e_{i,j,t}$$ 
+
+
+#### Likelihoods
+
+The _complete data likelihood_ depends on the nuissance parameters, the un-observed values of $X_{jt}$.
+Considering the indicator of the observation $I\!I(X_{jt})$ taking a value of 1 if $X_{jt}$ is observed and zero otherwise, the complete data likelihood can be written as:
+
+$$P(X_{t},\ldots,X_{0}\mid \Theta, \sigma^2,X^*_{t}) =  P(X_{0})\prod_{j=1}^J\prod_{s=1}^t \left[P(X_{jt}\mid X_{t-1}, \Theta)^{I\!I(X_{jt})}P(X_{jt}^*\mid X_{t-1}, \Theta)^{1-I\!I(X_{jt})}\right] $$
+
+
+Typically we are interested in the observed (marginal) data likelihood:
+
+$$P(X_{t},\ldots,X_{0}\mid \Theta, \sigma^2) =  \int_\chi P(X_{0})\prod_{j=1}^J\prod_{s=1}^t \left[P(X_{jt}\mid X_{t-1}, \Theta)^{I\!I(X_{jt})}P(X_{jt}^*\mid X_{t-1}, \Theta)^{1-I\!I(X_{jt})}\right] \cdot X_{j}^*$$
+
+To obtain maximum likelihood estimates we would typically use a Laplace approximation to integrate out the unobserved states as part of the numerical optimization routine.  Here we choose to marginalize out the nuissance parameters without an approximation by taking a Bayesian approach.  The Bayesian approach also makes fewer assumptions related to producing interval estimates.
+
+
+
+
+#### Priors
+
+The coefficients $\theta=[a,b,c]$ and residual error, $\sigma^2_{i}$, all need priors, of which we use these models:
+
+
+$$a,b,c\overset{iid}{\sim }N(0,1)$$
+$$\sigma\overset{iid}{\sim }InverseGamma(1,1)$$
+$$DTP_0 \overset{iid}{\sim }Uniform(0,1)$$
+If we use a **log** version of the data to avoid inconveniently negative model predictions, then the prior becomes
+$$log(DTP_0) \overset{iid}{\sim }N(-3,sd=4) = N(log(.05), sd = log(3))$$
+
+
+
+
+## Sampling Scheme
+
+Use Metropolis Hastings.  This is not terribly slow to sample.
+
+
+- **sample DTP(0)** if missing using MH.  Propose DTP(0), propagate model forward conditional on $a,b,c,\sigma,DTP^*$, where $DTP^*$ are missing values and then make a decision.
+- **sample missing** $DTP^*$ using Gibbs step.  Do this by propagating the model forward from the previous time step.  This is Gibbs sampling conditional on $a,b,c,\sigma,DTP^*, DTP0$.  
+- **sample parameters in blocks** $a,b,c$ using MH.  Propose values, then propagate the model forward, assessing the data fit as you go.  The likelihood should be estimated at each time point by comparing the observed point at time $t$ with the predicted likelihood of that time point conditional on all parameters and information from times $0,...,t-1$.  Sampling is split into 3 components (1), the $j$ vector of $a$, (2) the **p** vectors $b_{jp}$, (3)the **J** vectors of $c_{j,k}$.
+- **sample the variance term** $\sigma$ using Metropolis Hastings, though later this can be done using a more efficient and direct Gibbs step.
+
+
+## MCMC
+
+
+The code will run vanilla MCMC, though it could be slow to converge.  It is generally better to use HMC by re-writing everything in STAN or by using parallel tempering and performing some heavy tuning.  The latter is the approach that this document takes.
+
+##### Set up:
+
+```{r preamble}
+if(!exists("niter")){ niter = 50000 }    # total number of iterations
+print(niter)
+if(!exists("nstops")){nstops = 200  }   # number of times to assess the acceptance rate 
+print(nstops)
+Nparblocks = if(length(which(is.na(data[1,])))>0){5}else{4}#{A,B,C,sigma2, DTP0?}
+step_var = rep(.01,Nparblocks)      # starting transition variance for {A,B,C, sigma2}
+temperatures = c(.25,.5,.75,.875,1) #  temperatures for the MCMC
+```
+
+
+
+
+##### Run MCMC:
+
+Note that the filename is auto generated to include information about using _log_ data, the topic and countries of interest.   When we scale up to many countries naming will need to be improved.
+
+```{r MCMC}
+#| code-fold: true
+#| cache: true
+
+filename = paste0(prefix,"data_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+
+print(filename)
+
+
+P = 1 # max lag
+Goal_acceptance_rate = c(.23,.23,.23,.44,.44)
+
+T1 = Sys.time()
+
+PT_results = Run_PT(niter,  #MCMC iterations
+                  temperatures, # temperatures for PT
+                  data, # raw data with potential missing values
+                  P, # max lag
+                  nstops,
+                  Goal_acceptance_rate = c(.23,.23,.23,.44,.44), # target sampling acceptance rate for {A, B, C, sigma2, DTP0}
+                  filename = NULL,
+                  step_var = rep(0.1, 5),# initial guess at transition variance can be user specified.
+                  CCor = diag(1, ncol(data)*(ncol(data)-1)) # potential correlation structure for C if known 
+                  )
+
+
+
+elapsed = Sys.time() - T1 
+saveRDS(PT_results$CCor, paste0("CCor_",gsub(filename, pattern = "Rdata", replacement = "rds")))
+cat(paste("total compute time: ", round(as.numeric(elapsed, units = "secs"),2)," seconds"))
+save.image(filename)
+
+
+```
+
+
+## Results
+
+Discard the first half of the MCMC run since I was aggresively adapating the chains to facilitate burn in and tuning.
+
+
+```{r}
+#| code-fold: true
+
+
+# plot the posterior predictive fit based on a posterior sample:
+Nsam = 1000 # just used for this plot
+
+NChain = length(PT_results$temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = NA
+for(sample_use in 1:Nsam){
+  index = sample(floor(niter/2):niter, size = 1)
+  data_infill = data
+  if(length(PT_results$DTP0_index)>0){data_infill[1,] = PT_results$theta[[NChain]][index,PT_results$DTP0_index]}
+  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
+  inds_keep[sample_use] = index
+  for(time_index in (P+1):nrow(data)){
+    prop_model = model_propagate(PT_results$theta[[NChain]][index,],PT_results$sigma2[[NChain]][index],data_infill[(1:time_index-1),],P = 1)$prediction
+    data_infill[time_index,] = prop_model
+    for(variable in 1:length(prop_model)){
+      datafull[[variable]][sample_use, time_index] = prop_model[variable,1]
+    }
+  }
+}
+
+matplot(t(datafull[[1]]), type = 'l', ylim= c(-.5,.5), main = "posterior predictive")
+points(data[,1], pch = "*", cex = 3, col= "red")
+
+pairs(cbind(logpost_samp, datafull[[1]][,nrow(data)],datafull[[2]][,nrow(data)],datafull[[3]][,nrow(data)],datafull[[4]][,nrow(data)]))
+plot(logpost_samp, datafull[[1]][,nrow(data)])
+
+matplot(t(datafull[[1]]), type = 'l', ylim= c(-2,2))
+points(data[,1], pch = "*", cex = 3, col= "red")
+pairs(cbind(logpost_samp, datafull[[1]][,nrow(data)],datafull[[2]][,nrow(data)])
+plot(inds_keep,logpost_samp)
+plot(inds_keep,datafull[[1]][,nrow(data)])
+
+
+
+
+
+
+
+
+
+#Check sampling:
+
+# logposterior
+LP = data.frame(logpost = unlist(PT_results$log_posterior),
+   temp = as.character(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2))
+LP|>
+  filter(index  %% 5 ==0) |>
+  ggplot()+
+  geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
+  ggtitle("Log unnormalized posterior")
+
+# sigma2
+LP = data.frame(sigma2 = unlist(PT_results$sigma2),
+   temp = factor(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2))
+LP|>
+  ggplot()+
+  geom_density(aes(x = sigma2, colour = temp), alpha = .25)+
+  ggtitle("Sigma^2")
+
+
+
+# sigma2
+LP = data.frame(sigma2 = unlist(PT_results$sigma2),
+   temp = factor(rep(temperatures, each = niter)),
+   index = rep(1:niter,  length(temperatures)))|> filter(index>floor(niter/2))
+LP|>
+    ggplot()+
+    geom_line(aes(y = sigma2, x = index, color = temp), alpha = .5)+
+    ggtitle("Sigma^2")
+
+# theta
+LP =
+  lapply(PT_results$theta, function(x){x|> 
+      as_tibble()|>
+      pivot_longer(everything(),names_to = "par", values_to = "val")|>
+  mutate(index = rep(1:niter, each = ncol(x)))
+    })
+
+stacked = NULL
+for(chain in 1:length(temperatures)){
+  stacked = stacked |> 
+    bind_rows(LP[[chain]] |> 
+                mutate(temp = as.factor(temperatures[chain])))
+}
+stacked |> 
+  filter(index>floor(niter/2))|>
+  filter(str_detect(par, pattern = "^A" ))|>
+  ggplot()+
+  geom_density(aes(x = val, group = temp, colour = temp ))+
+  facet_wrap(~par) + ggtitle("thetas, A")
+
+
+stacked |> 
+    filter(index>floor(niter/2))|>
+    filter(str_detect(par, pattern = "^B" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    facet_wrap(~par) + ggtitle("thetas, B")
+
+
+stacked |> 
+    filter(index>floor(niter/2))|>
+    filter(str_detect(par, pattern = "^C" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+
+
+
+boxplot(PT_results$DTP_missing[[NChain]][(niter/2):niter,], main = "missing values")
+
+
+
+```
+
+
+
+
+## Running this on real data:
+
+-  Yes my code could be made more efficient, but piloting code with a small number of iterations, then just letting it run for an hour is a very appropriate strategy.
+- Another reasonable solution is to use a warm starting point by pushing the log posterior into an optimizer and extracting the max and the second derivative of the log posterior with respect to the parameters.  Use the inverse second deriv as the starting point for the transition variance (**step\_var**) and **CCor**.  
+- Use the script to extract the R code, because this will take a while to run. 
+
+```{r purl}
+#| eval: false
+
+knitr::purl("Data_PTmodelling.qmd")
+
+
+```
+
