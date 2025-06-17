@@ -135,7 +135,7 @@ $$P(X_{t},\ldots,X_{0}\mid \Theta, \sigma^2,X^*_{t}) =  P(X_{0})\prod_{j=1}^J\pr
 
 Typically we are interested in the observed (marginal) data likelihood:
 
-$$P(X_{t},\ldots,X_{0}\mid \Theta, \sigma^2) =  \int_\chi P(X_{0})\prod_{j=1}^J\prod_{s=1}^t \left[P(X_{jt}\mid X_{t-1}, \Theta)^{I\!I(X_{jt})}P(X_{jt}^*\mid X_{t-1}, \Theta)^{1-I\!I(X_{jt})}\right] \cdot X_{j}^*$$
+$$P(X_{t},\ldots,X_{0}\mid \Theta, \sigma^2) =  \int_\chi P(X_{0})\prod_{j=1}^J\prod_{s=1}^t \left[P(X_{jt}\mid X_{t-1}, \Theta)^{I\!I(X_{jt})}P(X_{jt}^*\mid X_{t-1}, \Theta)^{1-I\!I(X_{jt})}\right] dX_{jt}^*$$
 
 To obtain maximum likelihood estimates we would typically use a Laplace approximation to integrate out the unobserved states as part of the numerical optimization routine.  Here we choose to marginalize out the nuissance parameters without an approximation by taking a Bayesian approach.  The Bayesian approach also makes fewer assumptions related to producing interval estimates.
 
