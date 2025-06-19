@@ -456,7 +456,7 @@ Run_PT = function(niter,  #MCMC iterations
 ## dataload
 dataload = function(datafile, topic_of_interest, countries2use, start_date = ymd("2008-01-01")){
   
-  dataset = read_csv(paste0(datafolder,"nmf-time-series-g20.csv" ))
+  dataset = read_csv(datafile)
   
   
   data = dataset |> 
