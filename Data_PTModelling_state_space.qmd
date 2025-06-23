@@ -1,0 +1,403 @@
+---
+title: "Bayesian State Space Model"
+format: 
+  html:
+    html-math-method: mathjax
+    echo: true
+    eval: false
+---
+
+
+
+## State Space Model:
+
+State space models are a generalization of time series models, where the observations are driven by an underlying stochastic transition process, but may be observed with noise.
+
+
+A state space formulation implies that there is some stochastic process for the mean and we observe some stochastic process.   The observation process allows for the scenario where a Bank doesn't give speeches in a given month ($\alpha = 0$) or something else comes up.  The transition process models the evolution of topic importance, whereas the observation process allows those topics to be observed with noise.  Here "with noise" implies that a central bank only gives a sample of speeches in any time period.
+
+
+
+
+#### Observation process:
+
+
+$$DTP_{ijt} = \alpha_{ijt} \left[X_{ijt} + e_{i,j,t}\right], \ \ \ where\ \ \ e_{ijt}\sim N(0,\sigma^2_{e,i}),$$
+
+The observation process has the moments:
+
+$$E(DTP_{ijt}\mid X_{ijt}) = \alpha_{ijt} X_{ijt}$$
+To control whether or not the observation occurs we use $\alpha_{ijt}\in\{0,1\}$ where  $\alpha_{ijt} \sim Bernoulli(p_a)$.
+
+
+$$var(DTP_{ijt}\mid X_{ijt}, \alpha_{ijt}=1) = \sigma^2_{\epsilon,i}$$
+$$var(DTP_{ijt}\mid X_{ijt}, \alpha_{ijt}=0) = 0$$
+
+
+
+#### Un-observable Transition process:
+
+Dropping the reliance on the topic index _i_, the model transitions ahead based on the following stochastic process. 
+
+$$X_{jt} = a_j+b_{j} * X_{jt-1} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * X_{kt-1}+ \delta_{jt}$$
+Using matrix notation this can be handled with an appropriately defined $\Theta$ and by expanding $X_{jt-1}$ to include a column of 1s.
+$$= \Theta X_{jt-1}+ \delta_{jt}, \ \ \ where\ \ \ \delta_{jt}\sim N(0,\sigma_{\delta}^2).$$
+
+The un-observable transition process has the moments:
+
+$$E(X_{jt}\mid X_{jt-1}) = \Theta X_{jt-1}$$
+
+$$var(X_{jt}\mid X_{jt-1}) = \sigma^2_{\delta}$$
+And $X_{jt}\mid X_{jt-1}\sim N(\Theta X, \sigma^2_{\delta})$.
+
+
+
+
+
+However, using the matrix notation we can re-write moments for the observation process
+$$E(DTP_{jt}\mid X_{jt-1}) = \alpha \Theta X_{jt}$$
+
+But we already know the values of $\alpha_{jt} \in\{0,1\}$ which tracks the observed zeros or ones, such that $\alpha_{jt}\sim Bernoulli (p_a)$.   **In a future version**, it will be useful to set up $p_a$ to be time varying, allowing for topics like covid and the unprovoked invasion of Ukraine to be turned off / on.  
+When we observe zero for this topic or we do not observe a speech, then we have $\alpha_{jt}=0$ and $\alpha_{jt}=1$ otherwise.
+
+
+#### The Complete data likelihood:
+
+$$P(X_{ijt},\ldots X_{ij0},DTP_{ijt},\ldots,DTP_{ij0}\mid \Theta, p_a, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}) = P(\alpha\mid p_a)P(X_{ij0})\prod_{s=1}^t P(X_{ijs}\mid X_{ijs-1}, \Theta)P(DTP_{ijs}\mid\Theta, p_a, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i},X_{ijs})$$
+
+
+#### The Observed data (marginal) likelihood:
+
+$$P(DTP_{ijt},\ldots,DTP_{ij0},\alpha_{jt}\mid \Theta, p_a, \sigma^2_{\epsilon}, \sigma^2_{\delta}) = \int_\chi\cdots\int_\chi P(\alpha\mid p_a)P(X_{j0})\prod_{s=1}^t P(X_{js}\mid X_{js-1} \Theta)\left[P(DTP_{js}\mid\Theta, p_a, \sigma^2_{\epsilon}, \sigma^2_{\delta},X_{js}))\right]^{\alpha_{jt}}dX_{j0}\cdots dX_{jT}$$
+
+We could use a Laplace Approximation to integrate out the nuissance parameters $X$ and the unobserved $DTP$ values to obtain the MLE for $\Theta, \alpha, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}$.  This becomes a numerical optimization routing where the optimizer needs to handle the Laplace approximation at each iteration until the marginal likelihood is optimized.
+
+#### Bayesian Approach:
+
+
+Include priors on structural parameters $X_{ij0},\Theta, p_a, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}$, then sample from the joint posterior of all structural parameters and the nuissance parameters.  Discard the samples from the nuissance parameters to marginalize / integrate them out leaving a sample from $P(X_{ij0},\Theta, \alpha, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i} \mid DTP_{ij1},...,DTP_{ijt})$.   The sampler may be inefficient and take a while to converge unless you get fancy.  Here we get fancy by using Parallel Tempering. 
+
+
+
+## Basics
+
+Note, when running as a script, we can define **niter**, **nstops**, and the saving **filename** externally.
+Defaults, if not provided are: niter = 50000;nstops = 100; filename = "realdata_interim_results2.Rdata"
+
+```{r version}
+#| code-fold: true
+version
+library(tidyverse)
+library(lubridate)
+library(truncnorm)
+library(mvtnorm)
+# import main functions
+source("MCMC_SS_functions.R")     # Main Metropolis Hasting for vectorized state space model
+```
+
+
+
+## Priors
+
+The coefficients $\theta=[a,b,c]$, process evolution noise $\sigma_{\delta}^2$ observational error, $\sigma^2_{e}$, the initial unobserved process $X_{j0}$, and the probability of observation $p_a$, all need priors, of which we use these models:
+
+
+$$a,b,c\overset{iid}{\sim }N(0,1)$$
+$$\sigma_{\delta}^2\sim exponential(1/.01)$$
+$$\sigma_{e}^2\sim exponential(1/.0001)$$
+The exponential distributions are parameterized using the same convention as _R_, so that $Z\sim exponential(1/\theta)$ has $E(Z) = \theta$. The prior means for the Standard Deviations are then $\sqrt{.01} = .1$ for the observation transitions, and $\sqrt{.0001} = .01$ for the observation noise process.  These may be swapped out for an inverse gamma at some point. 
+
+$X_{j0} \overset{iid}{\sim }N(0,1)$$
+$$p_a\sim U(0,1)$$
+
+
+## User Defined Options
+
+Note that there are some switches that a user may define here.  In this code block the user defines:
+
+1. the location and file containing the time series of topics.
+2. the topic of interest
+3. the countries to use
+4. The first month to use.
+5. deciding if the log or raw data should be used.
+
+```{r user_defined_options}
+# 1. location and filename
+datafolder = "cbspeeches-main/inst/data-misc/"
+datafile   = paste0(datafolder,"nmf-time-series-g20.csv")
+
+#2. topic of interest
+candidate_topics = c("inflat" ,"brexit", "covid", "cbdc", "ukrain" )
+(topic_of_interest = candidate_topics[1])
+
+#3 countries to use.  
+# possible option
+G7_countries = c ("Canada", "France", "Germany", "Italy", "Japan",  "United Kingdom","United States")
+# possible option
+CUSA = c ("Canada","United States")
+# actual decision:
+countries2use = G7_countries# unique(dataset$country)
+
+#4 first month to use
+start_date = ymd("2008-11-01")
+
+#5 decision to log (or not log) the dataset.  Note that the data is transformed and the "prefix" is 
+# prefix = "log"   # since using log transformed data.
+prefix = "raw" # if not using log transformed data.
+# LOG STUFF IS NOT TESTED SINCE IT REQUIRES SOME ADJUSTMENTS TO PRIORS ON X
+
+```
+
+
+
+
+## Data Loading:
+
+
+```{r dataload}
+
+
+#. just loading and maybe transforming the data:
+data_full = dataload(datafile, topic_of_interest, countries2use, start_date)
+dates_in_use = data_full$dates_in_use
+if(prefix == "log"){
+  data         = log(data_full$data)
+}else{
+  data = data_full$data
+}
+```
+
+
+
+
+## Sampling Scheme
+
+Use Metropolis Hastings.  This will be slow to sample.  In future move to a Sequential Monte Carlo variant and / or sample $p_a, \sigma^2_\delta, \sigma^2_e$ directly using Gibbs steps. 
+
+1. **sample parameters in blocks** $a$ using MH.
+2. **sample parameters in blocks** $b$ using MH.
+3. **sample parameters in blocks** $c$ using MH.  We expect correlations beteen country effects, so these are sampled using multivariate Normal.
+4. **propose** $X_{0}$ and then propagate $X_{t}\mid X_{0}$. Then make a decision for this MH step based on the collective set of $X_{\cdot}$. We expect correlations between starting points for latent states, so these are sampled using multivariate Normal.
+5. **sample** $p_a$ using MH.
+6. **sample** $\sigma^2_\delta$ using MH.
+7. **sample** $\sigma^2_e$ using MH.
+
+
+
+## MCMC 
+
+
+Since vanilla MCMC will be slow to converge when there are many parameters, it is generally better to use HMC by re-writing everything in STAN or by using parallel tempering and performing some heavy tuning.  The latter is the approach that this document takes.  The alternative is to run Sequential Monte Carlo, which generlaly performs well for State Space models
+Set up the MCMC details.
+
+
+```{r preamble}
+#| code-fold: true
+
+if(!exists("niter")){ niter = 5000 }    # total number of iterations
+print(niter)
+if(!exists("nstops")){nstops = 50  }   # number of times to assess the acceptance rate 
+print(nstops)
+Nparblocks = 7 #{pa,X,A,B,C,sigma2_delta,sigma2_e}
+step_var = .01      # starting transition variances for {pa,X,A,B,C,sigma2_delta,sigma2_e}
+temperatures = c(.25,.5,.75,.875,1) # 5 temperatures for the MCMC
+```
+
+Run the MCMC.
+
+
+
+
+```{r MCMC}
+#| code-fold: true
+
+
+
+filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+print(filename)
+
+P = 1 # max lag
+
+
+T1 = Sys.time()
+
+PT_results = Run_PT_SS(niter,  #MCMC iterations
+                  temperatures, # temperatures for PT
+                  data, # raw data with potential missing values
+                  P, # max lag
+                  nstops,
+                  Goal_acceptance_rate = c(pa = .44,
+                                           X = .23,
+                                           A = .23,
+                                           B = .23,
+                                           C = .23,
+                                           sigma2_delta = .44,
+                                           sigma2_e = .44), # target sampling acceptance rates
+                  filename = filename,
+                  step_var = 0.1,# initial guess at transition variance can be user specified.
+                  CCor = diag(1, ncol(data)*(ncol(data)-1)) # potential correlation structure for C if known 
+                  )
+
+
+
+elapsed = Sys.time() - T1 
+saveRDS(PT_results$CCor, paste0("CCor_",gsub(filename, pattern = "Rdata", replacement = "rds")))
+cat(paste("total compute time: ", round(as.numeric(elapsed, units = "secs"),2)," seconds"))
+save.image(filename)
+
+
+```
+
+
+## Make some plots:
+
+As always, discard the part of the MCMC where I was adapting the chains:
+
+
+```{r}
+
+
+
+
+
+
+Nsam = 1000
+
+NChain = length(temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = NA
+for(sample_use in 1:Nsam){
+  index = sample(floor(niter/2):niter, size = 1)
+  data_infill = data
+  if(length(DTP0_index)>0){data_infill[1,] = PT_results$theta[[NChain]][index,DTP0_index]}
+  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
+  inds_keep[sample_use] = index
+  for(time_index in (P+1):nrow(data)){
+    prop_model = model_propagate(PT_results$theta[[NChain]][index,],PT_results$sigma2[[NChain]][index],data_infill[(1:time_index-1),],P = 1)$prediction
+    data_infill[time_index,] = prop_model
+    for(variable in 1:length(prop_model)){
+      datafull[[variable]][sample_use, time_index] = prop_model[variable,1]
+    }
+  }
+}
+
+matplot(t(datafull[[1]]), type = 'l', ylim= c(-.5,.5), main = "posterior predictive")
+points(data[,1], pch = "*", cex = 3, col= "red")
+
+pairs(cbind(logpost_samp, datafull[[1]][,nrow(data)],datafull[[2]][,nrow(data)],datafull[[3]][,nrow(data)],datafull[[4]][,nrow(data)]))
+plot(logpost_samp, datafull[[1]][,nrow(data)])
+
+matplot(t(datafull[[1]]), type = 'l', ylim= c(-2,2))
+points(data[,1], pch = "*", cex = 3, col= "red")
+pairs(cbind(logpost_samp, datafull[[1]][,nrow(data)],datafull[[2]][,nrow(data)])
+plot(inds_keep,logpost_samp)
+plot(inds_keep,datafull[[1]][,nrow(data)])
+
+
+
+
+
+
+
+
+
+#Check sampling:
+
+# logposterior
+LP = data.frame(logpost = unlist(PT_results$log_posterior),
+   temp = as.character(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> filter(index>floor(niter/50))
+LP|>
+  filter(index  %% 5 ==0) |>
+  ggplot()+
+  geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
+  ggtitle("Log unnormalized posterior")
+
+# sigma2
+LP = data.frame(sigma2 = unlist(PT_results$sigma2),
+   temp = factor(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> filter(index>floor(niter/5))
+LP|>
+  ggplot()+
+  geom_density(aes(x = sigma2, colour = temp), alpha = .25)+
+  ggtitle("Sigma^2")
+
+
+
+# sigma2
+LP = data.frame(sigma2 = unlist(PT_results$sigma2),
+   temp = factor(rep(temperatures, each = niter)),
+   index = rep(1:niter,  length(temperatures)))|> filter(index>floor(niter/5))
+LP|>
+    ggplot()+
+    geom_line(aes(y = sigma2, x = index, color = temp), alpha = .5)+
+    ggtitle("Sigma2^")
+
+# theta
+LP =
+  lapply(PT_results$theta, function(x){x|> 
+      as_tibble()|>
+      pivot_longer(everything(),names_to = "par", values_to = "val")|>
+  mutate(index = rep(1:niter, each = ncol(x)))
+    })
+
+stacked = NULL
+for(chain in 1:length(temperatures)){
+  stacked = stacked |> 
+    bind_rows(LP[[chain]] |> 
+                mutate(temp = as.factor(temperatures[chain])))
+}
+stacked |> 
+  filter(index>floor(niter/5))|>
+  filter(str_detect(par, pattern = "^A" ))|>
+  ggplot()+
+  geom_density(aes(x = val, group = temp, colour = temp ))+
+  facet_wrap(~par) + ggtitle("thetas, A")
+
+
+stacked |> 
+    filter(index>floor(niter/5))|>
+    filter(str_detect(par, pattern = "^B" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    facet_wrap(~par) + ggtitle("thetas, B")
+
+
+stacked |> 
+    filter(index>floor(niter/5))|>
+    filter(str_detect(par, pattern = "^C" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+
+
+
+boxplot(PT_results$DTP_missing[[NChain]][(niter/2):niter,], main = "missing values")
+
+
+
+```
+
+
+
+
+## Running this on real data:
+
+- Real data will probably work using this code.  If values go beyond [0,1] then a transformation will need to be performed or the model adapted.
+- A real value for **niter** will be something more like 10,000 but more is better.  Expect the code to take a while.  Yes my code could be made more efficient, but piloting code with a small number of iterations, then just letting it run overnight is a very appropriate solution.
+- Another reasonable solution is to push the log posterior into an optimizer and extract the max and the second derivative of the log posterior with respect to the parameters.  Use the inverse second deriv as the starting point for the transition variance (**step\_var**).  That way it handles the correlation structure.  When I do that, I typically scale back the correlation somewhat before using.  You'll also need to replace the **rnorm** with a multivariate Gaussian sampler.
+- Use the script to extract the R code, because this will take a while to run. Note that the script will need to be adjusted because this quarto file generates some fake data.
+
+```{r purl}
+#| eval: false
+
+knitr::purl("Data_PTmodelling_state_space.qmd")
+
+
+```
+
+
+## Future Work
+
+Sequentially constrained monte carlo would be a much more efficient sampling tool here rather than parallel tempering. 
