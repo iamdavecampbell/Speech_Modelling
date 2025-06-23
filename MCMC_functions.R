@@ -526,7 +526,7 @@ model_propagate = function(theta,sigma2,data,P = 1){
   # predict the model ahead by one time increment
   #$$DTP_{ijt} = a_j + \sum_pb_{jp} * DTP_{ijt-p} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * DTP_{ikt-1}   + d * X_{i,j,t}  + e_{i,j,t}#
   J     = ncol(data) #Ncountries
-  error = rnorm(J,mean = 0,sigma2)
+  error = rnorm(J,mean = 0,sqrt(sigma2))
   Number_of_a = J
   Number_of_b = J*P
   Number_of_c = (J-1)*J# We don't go into lags larger than 1 for the other countries
