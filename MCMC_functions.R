@@ -408,7 +408,10 @@ Run_PT = function(niter,  #MCMC iterations
             step_var[[chain]][par_index] = step_var[[chain]][par_index] * rate[[chain]][current_stop-1,par_index] / Goal_acceptance_rate[par_index]; 
           }
         }
-        if(iter&&2*floor(current_stop*niter/nstops && iter<= niter/2)){ # less often make an adjustment to the correlation structure: 
+        # modify if it has been run for a while, but stop before it's been running for too long.  & Also make sure that there have been some accepted values:
+        if( current_stop>2 &&
+            iter<= niter/2 && 
+            nrow( unique(theta[[chain]][floor(iter/2):iter,C_index]))>2){ # less often make an adjustment to the correlation structure: 
           CCor2[[chain]] = cor(theta[[chain]][floor(iter/2):iter,C_index])*.8 # shrink correlations down since I'm sure they're wrong
           diag(CCor2[[chain]]) = 1
           CCor[[chain]] = (CCor[[chain]] + CCor2[[chain]]) / 2 # average them so that it moves in a less twitchy manner.
@@ -478,18 +481,53 @@ dataload = function(datafile, topic_of_interest, countries2use, start_date = ymd
 
 
 
+# ## logprior - prior on sigma2 is  exponential(1)
+# logprior = function(theta,sigma2,DTP0=NULL, filename = NULL){
+#   # $$\sigma\overset{iid}{\sim }exponential(1)$$  
+#   if(sigma2 <= 0){ #case 1 negative variance
+#     # negative variance is bad
+#     logprior = -Inf
+#   }else{
+#     if((is.null(DTP0) | length(DTP0)==0) ){ #positive variance, no missing values at time zero
+#       # no starting point to deal with,
+#       logprior = sum(dnorm(theta, log = TRUE)) -sigma2
+#     }else{#positive variance, with missing values at time zero
+#       if(ifelse(is.null(filename), TRUE, !grep(filename, pattern = "^log", ignore.case = TRUE))){#positive variance, with missing values at time zero, and not taking the log of observations
+#         # null filename or not starting with "log" flag:
+#         # there is a starting point DTP0 to deal with...
+#         # if we are using the log of the data (removes the negative constraint on starting point)
+#         # do this by checking the filename for the starting term "log"
+#         if(min(DTP0)>=0 && max(DTP0)<=1 ){#positive variance, with missing values at time zero, and not taking the log of observations, and starting point is between zero and 1
+#           # prior for time zero evaluation is uniform(0,1)
+#           logprior = sum(dnorm(theta, log = TRUE)) - sigma2
+#         }else{#positive variance, with missing values at time zero, and not taking the log of observations, and starting point is NOT between zero and 1
+#           # DTP0 is too large or too small
+#           logprior = -Inf
+#         }
+#       }else{#positive variance, with missing values at time zero, and  taking the log of observations
+#         # there is a starting point DTP0 to deal with
+#         logprior = sum(dnorm(theta, log = TRUE)) +
+#           sum(dnorm(DTP0, log = TRUE, mean = -3, sd = 4)) - ##### mean is ~log(.05) and mean-2sd is ~log(.0009), mean+2sd is ~log(3)=1.1
+#           sigma2
+#       }
+#     }
+#   }
+#   return(logprior)
+# }
+# 
+# # 
 
 ## logprior
 logprior = function(theta,sigma2,DTP0=NULL, filename = NULL){
-  # $$\sigma\overset{iid}{\sim }exponential(1)$$  
+  # \sigma2 ~ Exponential with mean .01
   if(sigma2 <= 0){ #case 1 negative variance
     # negative variance is bad
     logprior = -Inf
   }else{
     if((is.null(DTP0) | length(DTP0)==0) ){ #positive variance, no missing values at time zero
       # no starting point to deal with,
-      logprior = sum(dnorm(theta, log = TRUE)) +
-        log(1/sigma2)-1/sigma2
+      logprior = sum(dnorm(theta, log = TRUE)) -
+        sigma2/.01
     }else{#positive variance, with missing values at time zero
       if(ifelse(is.null(filename), TRUE, !grep(filename, pattern = "^log", ignore.case = TRUE))){#positive variance, with missing values at time zero, and not taking the log of observations
       # null filename or not starting with "log" flag:
@@ -498,8 +536,8 @@ logprior = function(theta,sigma2,DTP0=NULL, filename = NULL){
       # do this by checking the filename for the starting term "log"
       if(min(DTP0)>=0 && max(DTP0)<=1 ){#positive variance, with missing values at time zero, and not taking the log of observations, and starting point is between zero and 1
         # prior for time zero evaluation is uniform(0,1)
-        logprior = sum(dnorm(theta, log = TRUE)) +
-          log(1/sigma2)-1/sigma2
+        logprior = sum(dnorm(theta, log = TRUE)) -
+          sigma2/.01
       }else{#positive variance, with missing values at time zero, and not taking the log of observations, and starting point is NOT between zero and 1
         # DTP0 is too large or too small
         logprior = -Inf
@@ -507,14 +545,14 @@ logprior = function(theta,sigma2,DTP0=NULL, filename = NULL){
         }else{#positive variance, with missing values at time zero, and  taking the log of observations
             # there is a starting point DTP0 to deal with
             logprior = sum(dnorm(theta, log = TRUE)) +
-              sum(dnorm(DTP0, log = TRUE, mean = -3, sd = 4)) + ##### mean is ~log(.05) and mean-2sd is ~log(.0009), mean+2sd is ~log(3)=1.1
-              log(1/sigma2)-1/sigma2
+              sum(dnorm(DTP0, log = TRUE, mean = -3, sd = 4)) - ##### mean is ~log(.05) and mean-2sd is ~log(.0009), mean+2sd is ~log(3)=1.1
+              sigma2/.01
         }
         }
       }
   return(logprior)
 }
-
+############################
 ## model_propagate
 model_propagate = function(theta,sigma2,data,P = 1){
   
@@ -526,7 +564,7 @@ model_propagate = function(theta,sigma2,data,P = 1){
   # predict the model ahead by one time increment
   #$$DTP_{ijt} = a_j + \sum_pb_{jp} * DTP_{ijt-p} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * DTP_{ikt-1}   + d * X_{i,j,t}  + e_{i,j,t}#
   J     = ncol(data) #Ncountries
-  error = rnorm(J,mean = 0,sqrt(sigma2))
+  error = rnorm(J,mean = 0,sd = sqrt(sigma2))
   Number_of_a = J
   Number_of_b = J*P
   Number_of_c = (J-1)*J# We don't go into lags larger than 1 for the other countries

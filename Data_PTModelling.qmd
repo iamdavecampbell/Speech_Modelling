@@ -1,5 +1,5 @@
 ---
-title: "Data_PTModelling"
+title: "Bayesian VAR model"
 format: 
   html:
     html-math-method: mathjax
@@ -7,6 +7,26 @@ format:
     eval: false
 ---
 
+
+
+
+## The Model 
+
+We model the topic proportion for topic **i**, from country **j** at time **t**, $DTP_{ijt}$, as a function of lagged information, $DTP_{ijt-1}$, information from countries other than country $j\in 1,...,J$, $DTP_{i(-j)t-1}$, and exogenous variables, $X_{i,j,t}$,
+
+<!-- $$DTP_{ijt} = a + b * DTP_{ijt-1} + c * DTP_{i(-j)t-1}   + d * X_{i,j,t} + f * Country \times Month_{j,t} + e$$ -->
+$$DTP_{ijt} = a_j + \sum_pb_{jp} * DTP_{ijt-p} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * DTP_{ikt-1}     + e_{i,j,t}, \ \ \ where\ \ \ e\sim N(0,\sigma^2_{i}).\label{eq:dtpijt}$$
+Where we drop the dependence on $i$ when it is not ambiguous.  For simplicity of notation consider only lag $p=1$, but note that extensions are straight forward.  
+
+
+The model coefficients include the $J$ intercepts, $a=[a_1,...,a_J]$, the $J*P$ slopes for each country and lag combination $b=[b_{1,1},...,b_{j,p},...,b_{JP}]$, the $J*(J-1)$ coefficients connecting country $j$ to all other countries $[c_{1,2},...,c_{j,k},...,c_{J,J-1}]$,  the residual variance $\sigma^2$, and the initial condition for the model $DTP_0 = [DTP_{10},...,DTP_{J0}$. The nuissance parameters are the unobserved $DTP^*_{jt}$.  We could write this in matrix form by defining the parameter matrix by concatenating $\Theta = [a,b,c]$ and similarly putting together all the pieces from this time stamp into $X_{jt}=DTP_{jt}$ giving the model:
+
+$$X_{t} = \theta X_{t-1}+ e_{i,j,t}$$ 
+
+
+### Notes about VAR models
+
+VARs are designed to be realistic about the uncertainty rather than accurate when it comes to prediction.  If the model is stationary / stable, then probably the parameters $b_\cdot$ and $c_\cdot$ will tend towards zero leaving the full signal as noise.
 
 
 
@@ -45,7 +65,7 @@ datafile   = paste0(datafolder,"nmf-time-series-g20.csv")
 
 #2. topic of interest
 candidate_topics = c("inflat" ,"brexit", "covid", "cbdc", "ukrain" )
-(topic_of_interest = candidate_topics[1])
+(topic_of_interest = candidate_topics[4])
 
 #3 countries to use.  
 # possible option
@@ -59,8 +79,8 @@ countries2use = G7_countries# unique(dataset$country)
 start_date = ymd("2008-11-01")
 
 #5 decision to log (or not log) the dataset.  Note that the data is transformed and the "prefix" is 
-prefix = "log"   # since using log transformed data.
-# prefix = "raw" # if not using log transformed data.
+# prefix = "log"   # since using log transformed data.
+prefix = "raw" # if not using log transformed data.
 
 ```
 
@@ -88,7 +108,7 @@ if(prefix == "log"){
           ylab = "Log Topic Proportion",
           xlab = "date")
 }else{
-  data         = data_full$data
+  data = data_full$data
 }
 
 ```
@@ -106,23 +126,14 @@ tmp = data_full$data[!is.na(data_full$data)]; tmp = tmp[tmp!=0]; summary(tmp)
 # Injecting a fix:
 if(prefix == "log"){
   data[is.infinite(data)] = log(min(tmp)/2)
+  matplot(x = dates_in_use,y=data, type="l", 
+          main = topic_of_interest, 
+          ylab = "Log Topic Proportion",
+          xlab = "date")
 }
 
 ```
 
-
-## The Model 
-
-We model the topic proportion for topic **i**, from country **j** at time **t**, $DTP_{ijt}$, as a function of lagged information, $DTP_{ijt-1}$, information from countries other than country $j\in 1,...,J$, $DTP_{i(-j)t-1}$, and exogenous variables, $X_{i,j,t}$,
-
-<!-- $$DTP_{ijt} = a + b * DTP_{ijt-1} + c * DTP_{i(-j)t-1}   + d * X_{i,j,t} + f * Country \times Month_{j,t} + e$$ -->
-$$DTP_{ijt} = a_j + \sum_pb_{jp} * DTP_{ijt-p} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * DTP_{ikt-1}     + e_{i,j,t}, \ \ \ where\ \ \ e\sim N(0,\sigma^2_{i}).\label{eq:dtpijt}$$
-Where we drop the dependence on $i$ when it is not ambiguous.  For simplicity of notation consider only lag $p=1$, but note that extensions are straight forward.  
-
-
-The model coefficients include the $J$ intercepts, $a=[a_1,...,a_J]$, the $J*P$ slopes for each country and lag combination $b=[b_{1,1},...,b_{j,p},...,b_{JP}]$, the $J*(J-1)$ coefficients connecting country $j$ to all other countries $[c_{1,2},...,c_{j,k},...,c_{J,J-1}]$,  the residual variance $\sigma^2$, and the initial condition for the model $DTP_0 = [DTP_{10},...,DTP_{J0}$. The nuissance parameters are the unobserved $DTP^*_{jt}$.  We could write this in matrix form by defining the parameter matrix by concatenating $\Theta = [a,b,c]$ and similarly putting together all the pieces from this time stamp into $X_{jt}=DTP_{jt}$ giving the model:
-
-$$X_{t} = \theta X_{t-1}+ e_{i,j,t}$$ 
 
 
 #### Likelihoods
@@ -133,9 +144,9 @@ Considering the indicator of the observation $I\!I(X_{jt})$ taking a value of 1 
 $$P(X_{t},\ldots,X_{0}\mid \Theta, \sigma^2,X^*_{t}) =  P(X_{0})\prod_{j=1}^J\prod_{s=1}^t \left[P(X_{jt}\mid X_{t-1}, \Theta)^{I\!I(X_{jt})}P(X_{jt}^*\mid X_{t-1}, \Theta)^{1-I\!I(X_{jt})}\right] $$
 
 
-Typically we are interested in the observed (marginal) data likelihood:
+Typically we are interested in the observed (marginal) data likelihood after integrating over the missing values:
 
-$$P(X_{t},\ldots,X_{0}\mid \Theta, \sigma^2) =  \int_\chi P(X_{0})\prod_{j=1}^J\prod_{s=1}^t \left[P(X_{jt}\mid X_{t-1}, \Theta)^{I\!I(X_{jt})}P(X_{jt}^*\mid X_{t-1}, \Theta)^{1-I\!I(X_{jt})}\right] dX_{jt}^*$$
+$$P(X_{t},\ldots,X_{0}\mid \Theta, \sigma^2) =  \int_\chi P(X_{0})\prod_{j=1}^J\prod_{s=1}^t \left[P(X_{jt}\mid X_{t-1}, \Theta)^{I\!I(X_{jt})}P(X_{jt}^*\mid X_{t-1}, \Theta)^{1-I\!I(X_{jt})}\right]  dX^*$$
 
 To obtain maximum likelihood estimates we would typically use a Laplace approximation to integrate out the unobserved states as part of the numerical optimization routine.  Here we choose to marginalize out the nuissance parameters without an approximation by taking a Bayesian approach.  The Bayesian approach also makes fewer assumptions related to producing interval estimates.
 
@@ -170,7 +181,7 @@ Use Metropolis Hastings.  This is not terribly slow to sample.
 ## MCMC
 
 
-The code will run vanilla MCMC, though it could be slow to converge.  It is generally better to use HMC by re-writing everything in STAN or by using parallel tempering and performing some heavy tuning.  The latter is the approach that this document takes.
+Since vanilla MCMC will be slow to converge when there are many parameters, it is generally better to use HMC by re-writing everything in STAN or by using parallel tempering and performing some heavy tuning.  The latter is the approach that this document takes.  The alternative is to run Sequential Monte Carlo, which generlaly performs well for State Space models
 
 ##### Set up:
 
@@ -195,7 +206,7 @@ Note that the filename is auto generated to include information about using _log
 #| code-fold: true
 #| cache: true
 
-filename = paste0(prefix,"data_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+filename = paste0(prefix,"expo_prior_data_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
 
 print(filename)
 
@@ -258,13 +269,13 @@ for(sample_use in 1:Nsam){
   }
 }
 
-matplot(t(datafull[[1]]), type = 'l', ylim= c(-.5,.5), main = "posterior predictive")
+matplot(t(datafull[[1]]), type = 'l',  main = "posterior predictive")
 points(data[,1], pch = "*", cex = 3, col= "red")
 
 pairs(cbind(logpost_samp, datafull[[1]][,nrow(data)],datafull[[2]][,nrow(data)],datafull[[3]][,nrow(data)],datafull[[4]][,nrow(data)]))
 plot(logpost_samp, datafull[[1]][,nrow(data)])
 
-matplot(t(datafull[[1]]), type = 'l', ylim= c(-2,2))
+matplot(t(datafull[[1]]), type = 'l')
 points(data[,1], pch = "*", cex = 3, col= "red")
 pairs(cbind(logpost_samp, datafull[[1]][,nrow(data)],datafull[[2]][,nrow(data)])
 plot(inds_keep,logpost_samp)
@@ -371,6 +382,8 @@ boxplot(PT_results$DTP_missing[[NChain]][(niter/2):niter,], main = "missing valu
 
 knitr::purl("Data_PTmodelling.qmd")
 
-
+# Then run it as a script:
+# nohup Rscript Data_PTmodelling.R > logfile.txt &
+  
 ```
 
