@@ -4,7 +4,7 @@ format:
   html:
     html-math-method: mathjax
     echo: true
-    eval: false
+    eval: true
 ---
 
 
@@ -65,7 +65,7 @@ datafile   = paste0(datafolder,"nmf-time-series-g20.csv")
 
 #2. topic of interest
 candidate_topics = c("inflat" ,"brexit", "covid", "cbdc", "ukrain" )
-(topic_of_interest = candidate_topics[4])
+(topic_of_interest = candidate_topics[2])
 
 #3 countries to use.  
 # possible option
@@ -204,12 +204,11 @@ Note that the filename is auto generated to include information about using _log
 
 ```{r MCMC}
 #| code-fold: true
-#| cache: true
+#| eval: false
 
 filename = paste0(prefix,"expo_prior_data_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
 
 print(filename)
-
 
 P = 1 # max lag
 Goal_acceptance_rate = c(.23,.23,.23,.44,.44)
@@ -242,10 +241,37 @@ save.image(filename)
 
 Discard the first half of the MCMC run since I was aggresively adapating the chains to facilitate burn in and tuning.
 
+This part of the code produces plots.  Note that in here, I rebuild **filename** looping over the different topics, so that the plots will all be produced inside these tabs.  If you run this as a script you can just cut it all off at this point.
+
+
+
+::: panel-tabset
+
+```{r}
+#| echo: false
+#| output: asis
+topic_of_interest = candidate_topics[1]
+```
+
+## Topic `r topic_of_interest`
+
+
 
 ```{r}
 #| code-fold: true
+#| output: asis
 
+
+
+filename = paste0(prefix,"expo_prior_data_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+
+print(filename)
+
+
+
+
+# here load the file from above.  I don't run the above chunk when I compile so this is my hack
+load(filename)
 
 # plot the posterior predictive fit based on a posterior sample:
 Nsam = 1000 # just used for this plot
@@ -269,26 +295,23 @@ for(sample_use in 1:Nsam){
   }
 }
 
-matplot(t(datafull[[1]]), type = 'l',  main = "posterior predictive")
-points(data[,1], pch = "*", cex = 3, col= "red")
+for(country in 1:length(countries2use)){
+matplot(x = dates_in_use,
+  t(datafull[[country]]), 
+        type = 'l',  
+        main = paste("posterior predictive fit for country",
+                                                          colnames(data)[country]))
+points(x = dates_in_use,
+       data[,country], 
+       pch = "*", cex = 3, col= "red")
+}
 
-pairs(cbind(logpost_samp, datafull[[1]][,nrow(data)],datafull[[2]][,nrow(data)],datafull[[3]][,nrow(data)],datafull[[4]][,nrow(data)]))
-plot(logpost_samp, datafull[[1]][,nrow(data)])
+```
 
-matplot(t(datafull[[1]]), type = 'l')
-points(data[,1], pch = "*", cex = 3, col= "red")
-pairs(cbind(logpost_samp, datafull[[1]][,nrow(data)],datafull[[2]][,nrow(data)])
-plot(inds_keep,logpost_samp)
-plot(inds_keep,datafull[[1]][,nrow(data)])
+If a topic is non-stationary over this time duration then time series will aim for the _wilder_ behaviour and consider it typical over the _calmer_ time frame.  Time series will really just be honest about uncertainty with the goal of making predictions at the expense of modelling inference.
 
-
-
-
-
-
-
-
-
+```{r}
+#| code-fold: true
 #Check sampling:
 
 # logposterior
@@ -301,8 +324,18 @@ LP|>
   ggplot()+
   geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
   ggtitle("Log unnormalized posterior")
+```
+
+
+If the model variance term has a posterior centered on the data variance it suggests that there is no signal being modelled.  Another way to check this is by examining the posterior distributions for the parameters.
+
+
+```{r}
+#| code-fold: true
+
 
 # sigma2
+PT_results$sigma2[[which(temperatures ==1)]]|> summary()
 LP = data.frame(sigma2 = unlist(PT_results$sigma2),
    temp = factor(rep(temperatures, each = niter)),
         index = rep(1:niter,  length(temperatures)))|> 
@@ -310,18 +343,19 @@ LP = data.frame(sigma2 = unlist(PT_results$sigma2),
 LP|>
   ggplot()+
   geom_density(aes(x = sigma2, colour = temp), alpha = .25)+
-  ggtitle("Sigma^2")
+  ggtitle("Sigma^2, with vertical line at the data variance")+
+  geom_vline(xintercept = 
+         var(c(data_full$data),na.rm=TRUE)
+             )+
+  facet_wrap(~temp, scale = "free")
 
+```
 
+If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero.  However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
 
-# sigma2
-LP = data.frame(sigma2 = unlist(PT_results$sigma2),
-   temp = factor(rep(temperatures, each = niter)),
-   index = rep(1:niter,  length(temperatures)))|> filter(index>floor(niter/2))
-LP|>
-    ggplot()+
-    geom_line(aes(y = sigma2, x = index, color = temp), alpha = .5)+
-    ggtitle("Sigma^2")
+```{r}
+#| code-fold: true
+
 
 # theta
 LP =
@@ -359,14 +393,610 @@ stacked |>
     ggplot()+
     geom_density(aes(x = val, group = temp, colour = temp ))+
     geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+```
 
 
 
-boxplot(PT_results$DTP_missing[[NChain]][(niter/2):niter,], main = "missing values")
+```{r}
+#| echo: false
+
+topic_of_interest = candidate_topics[2]
+```
+
+## Topic `r topic_of_interest`
 
 
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+
+
+filename = paste0(prefix,"expo_prior_data_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+
+print(filename)
+
+
+
+
+# here load the file from above.  I don't run the above chunk when I compile so this is my hack
+load(filename)
+
+# plot the posterior predictive fit based on a posterior sample:
+Nsam = 1000 # just used for this plot
+
+NChain = length(PT_results$temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = NA
+for(sample_use in 1:Nsam){
+  index = sample(floor(niter/2):niter, size = 1)
+  data_infill = data
+  if(length(PT_results$DTP0_index)>0){data_infill[1,] = PT_results$theta[[NChain]][index,PT_results$DTP0_index]}
+  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
+  inds_keep[sample_use] = index
+  for(time_index in (P+1):nrow(data)){
+    prop_model = model_propagate(PT_results$theta[[NChain]][index,],PT_results$sigma2[[NChain]][index],data_infill[(1:time_index-1),],P = 1)$prediction
+    data_infill[time_index,] = prop_model
+    for(variable in 1:length(prop_model)){
+      datafull[[variable]][sample_use, time_index] = prop_model[variable,1]
+    }
+  }
+}
+
+for(country in 1:length(countries2use)){
+matplot(x = dates_in_use,
+  t(datafull[[country]]), 
+        type = 'l',  
+        main = paste("posterior predictive fit for country",
+                                                          colnames(data)[country]))
+points(x = dates_in_use,
+       data[,country], 
+       pch = "*", cex = 3, col= "red")
+}
 
 ```
+
+If a topic is non-stationary over this time duration then time series will aim for the _wilder_ behaviour and consider it typical over the _calmer_ time frame.  Time series will really just be honest about uncertainty with the goal of making predictions at the expense of modelling inference.
+
+```{r}
+#| code-fold: true
+#Check sampling:
+
+# logposterior
+LP = data.frame(logpost = unlist(PT_results$log_posterior),
+   temp = as.character(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2))
+LP|>
+  filter(index  %% 5 ==0) |>
+  ggplot()+
+  geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
+  ggtitle("Log unnormalized posterior")
+```
+
+
+If the model variance term has a posterior centered on the data variance it suggests that there is no signal being modelled.  Another way to check this is by examining the posterior distributions for the parameters.
+
+
+```{r}
+#| code-fold: true
+
+
+# sigma2
+PT_results$sigma2[[which(temperatures ==1)]]|> summary()
+LP = data.frame(sigma2 = unlist(PT_results$sigma2),
+   temp = factor(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2))
+LP|>
+  ggplot()+
+  geom_density(aes(x = sigma2, colour = temp), alpha = .25)+
+  ggtitle("Sigma^2, with vertical line at the data variance")+
+  geom_vline(xintercept = 
+         var(c(data_full$data),na.rm=TRUE)
+             )+
+  facet_wrap(~temp, scale = "free")
+
+```
+
+If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero.  However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
+
+```{r}
+#| code-fold: true
+
+
+# theta
+LP =
+  lapply(PT_results$theta, function(x){x|> 
+      as_tibble()|>
+      pivot_longer(everything(),names_to = "par", values_to = "val")|>
+  mutate(index = rep(1:niter, each = ncol(x)))
+    })
+
+stacked = NULL
+for(chain in 1:length(temperatures)){
+  stacked = stacked |> 
+    bind_rows(LP[[chain]] |> 
+                mutate(temp = as.factor(temperatures[chain])))
+}
+stacked |> 
+  filter(index>floor(niter/2))|>
+  filter(str_detect(par, pattern = "^A" ))|>
+  ggplot()+
+  geom_density(aes(x = val, group = temp, colour = temp ))+
+  facet_wrap(~par) + ggtitle("thetas, A")
+
+
+stacked |> 
+    filter(index>floor(niter/2))|>
+    filter(str_detect(par, pattern = "^B" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    facet_wrap(~par) + ggtitle("thetas, B")
+
+
+stacked |> 
+    filter(index>floor(niter/2))|>
+    filter(str_detect(par, pattern = "^C" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+```
+
+
+
+```{r}
+#| echo: false
+#| output: asis
+topic_of_interest = candidate_topics[3]
+```
+
+## Topic `r topic_of_interest`
+
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+
+
+filename = paste0(prefix,"expo_prior_data_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+
+print(filename)
+
+
+
+
+# here load the file from above.  I don't run the above chunk when I compile so this is my hack
+load(filename)
+
+# plot the posterior predictive fit based on a posterior sample:
+Nsam = 1000 # just used for this plot
+
+NChain = length(PT_results$temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = NA
+for(sample_use in 1:Nsam){
+  index = sample(floor(niter/2):niter, size = 1)
+  data_infill = data
+  if(length(PT_results$DTP0_index)>0){data_infill[1,] = PT_results$theta[[NChain]][index,PT_results$DTP0_index]}
+  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
+  inds_keep[sample_use] = index
+  for(time_index in (P+1):nrow(data)){
+    prop_model = model_propagate(PT_results$theta[[NChain]][index,],PT_results$sigma2[[NChain]][index],data_infill[(1:time_index-1),],P = 1)$prediction
+    data_infill[time_index,] = prop_model
+    for(variable in 1:length(prop_model)){
+      datafull[[variable]][sample_use, time_index] = prop_model[variable,1]
+    }
+  }
+}
+
+for(country in 1:length(countries2use)){
+matplot(x = dates_in_use,
+  t(datafull[[country]]), 
+        type = 'l',  
+        main = paste("posterior predictive fit for country",
+                                                          colnames(data)[country]))
+points(x = dates_in_use,
+       data[,country], 
+       pch = "*", cex = 3, col= "red")
+}
+
+```
+
+If a topic is non-stationary over this time duration then time series will aim for the _wilder_ behaviour and consider it typical over the _calmer_ time frame.  Time series will really just be honest about uncertainty with the goal of making predictions at the expense of modelling inference.
+
+```{r}
+#| code-fold: true
+#Check sampling:
+
+# logposterior
+LP = data.frame(logpost = unlist(PT_results$log_posterior),
+   temp = as.character(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2))
+LP|>
+  filter(index  %% 5 ==0) |>
+  ggplot()+
+  geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
+  ggtitle("Log unnormalized posterior")
+```
+
+
+If the model variance term has a posterior centered on the data variance it suggests that there is no signal being modelled.  Another way to check this is by examining the posterior distributions for the parameters.
+
+
+```{r}
+#| code-fold: true
+
+
+# sigma2
+PT_results$sigma2[[which(temperatures ==1)]]|> summary()
+LP = data.frame(sigma2 = unlist(PT_results$sigma2),
+   temp = factor(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2))
+LP|>
+  ggplot()+
+  geom_density(aes(x = sigma2, colour = temp), alpha = .25)+
+  ggtitle("Sigma^2, with vertical line at the data variance")+
+  geom_vline(xintercept = 
+         var(c(data_full$data),na.rm=TRUE)
+             )+
+  facet_wrap(~temp, scales = "free")
+
+```
+
+If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero.  However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
+
+```{r}
+#| code-fold: true
+
+
+# theta
+LP =
+  lapply(PT_results$theta, function(x){x|> 
+      as_tibble()|>
+      pivot_longer(everything(),names_to = "par", values_to = "val")|>
+  mutate(index = rep(1:niter, each = ncol(x)))
+    })
+
+stacked = NULL
+for(chain in 1:length(temperatures)){
+  stacked = stacked |> 
+    bind_rows(LP[[chain]] |> 
+                mutate(temp = as.factor(temperatures[chain])))
+}
+stacked |> 
+  filter(index>floor(niter/2))|>
+  filter(str_detect(par, pattern = "^A" ))|>
+  ggplot()+
+  geom_density(aes(x = val, group = temp, colour = temp ))+
+  facet_wrap(~par) + ggtitle("thetas, A")
+
+
+stacked |> 
+    filter(index>floor(niter/2))|>
+    filter(str_detect(par, pattern = "^B" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    facet_wrap(~par) + ggtitle("thetas, B")
+
+
+stacked |> 
+    filter(index>floor(niter/2))|>
+    filter(str_detect(par, pattern = "^C" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+```
+
+
+
+
+```{r}
+#| echo: false
+#| output: asis
+topic_of_interest = candidate_topics[4]
+```
+
+## Topic `r topic_of_interest`
+
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+
+
+filename = paste0(prefix,"expo_prior_data_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+
+print(filename)
+
+
+
+
+# here load the file from above.  I don't run the above chunk when I compile so this is my hack
+load(filename)
+
+# plot the posterior predictive fit based on a posterior sample:
+Nsam = 1000 # just used for this plot
+
+NChain = length(PT_results$temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = NA
+for(sample_use in 1:Nsam){
+  index = sample(floor(niter/2):niter, size = 1)
+  data_infill = data
+  if(length(PT_results$DTP0_index)>0){data_infill[1,] = PT_results$theta[[NChain]][index,PT_results$DTP0_index]}
+  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
+  inds_keep[sample_use] = index
+  for(time_index in (P+1):nrow(data)){
+    prop_model = model_propagate(PT_results$theta[[NChain]][index,],PT_results$sigma2[[NChain]][index],data_infill[(1:time_index-1),],P = 1)$prediction
+    data_infill[time_index,] = prop_model
+    for(variable in 1:length(prop_model)){
+      datafull[[variable]][sample_use, time_index] = prop_model[variable,1]
+    }
+  }
+}
+
+for(country in 1:length(countries2use)){
+matplot(x = dates_in_use,
+  t(datafull[[country]]), 
+        type = 'l',  
+        main = paste("posterior predictive fit for country",
+                                                          colnames(data)[country]))
+points(x = dates_in_use,
+       data[,country], 
+       pch = "*", cex = 3, col= "red")
+}
+
+```
+
+If a topic is non-stationary over this time duration then time series will aim for the _wilder_ behaviour and consider it typical over the _calmer_ time frame.  Time series will really just be honest about uncertainty with the goal of making predictions at the expense of modelling inference.
+
+```{r}
+#| code-fold: true
+#Check sampling:
+
+# logposterior
+LP = data.frame(logpost = unlist(PT_results$log_posterior),
+   temp = as.character(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2))
+LP|>
+  filter(index  %% 5 ==0) |>
+  ggplot()+
+  geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
+  ggtitle("Log unnormalized posterior")
+```
+
+
+If the model variance term has a posterior centered on the data variance it suggests that there is no signal being modelled.  Another way to check this is by examining the posterior distributions for the parameters.
+
+
+```{r}
+#| code-fold: true
+
+
+# sigma2
+PT_results$sigma2[[which(temperatures ==1)]]|> summary()
+LP = data.frame(sigma2 = unlist(PT_results$sigma2),
+   temp = factor(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2))
+LP|>
+  ggplot()+
+  geom_density(aes(x = sigma2, colour = temp), alpha = .25)+
+  ggtitle("Sigma^2, with vertical line at the data variance")+
+  geom_vline(xintercept = 
+         var(c(data_full$data),na.rm=TRUE)
+             )+
+  facet_wrap(~temp, scale = "free")
+
+```
+
+If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero.  However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
+
+```{r}
+#| code-fold: true
+
+
+# theta
+LP =
+  lapply(PT_results$theta, function(x){x|> 
+      as_tibble()|>
+      pivot_longer(everything(),names_to = "par", values_to = "val")|>
+  mutate(index = rep(1:niter, each = ncol(x)))
+    })
+
+stacked = NULL
+for(chain in 1:length(temperatures)){
+  stacked = stacked |> 
+    bind_rows(LP[[chain]] |> 
+                mutate(temp = as.factor(temperatures[chain])))
+}
+stacked |> 
+  filter(index>floor(niter/2))|>
+  filter(str_detect(par, pattern = "^A" ))|>
+  ggplot()+
+  geom_density(aes(x = val, group = temp, colour = temp ))+
+  facet_wrap(~par) + ggtitle("thetas, A")
+
+
+stacked |> 
+    filter(index>floor(niter/2))|>
+    filter(str_detect(par, pattern = "^B" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    facet_wrap(~par) + ggtitle("thetas, B")
+
+
+stacked |> 
+    filter(index>floor(niter/2))|>
+    filter(str_detect(par, pattern = "^C" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+```
+
+
+
+```{r}
+#| echo: false
+#| output: asis
+topic_of_interest = candidate_topics[5]
+```
+
+## Topic `r topic_of_interest`
+
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+
+
+filename = paste0(prefix,"expo_prior_data_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+
+print(filename)
+
+
+
+
+# here load the file from above.  I don't run the above chunk when I compile so this is my hack
+load(filename)
+
+# plot the posterior predictive fit based on a posterior sample:
+Nsam = 1000 # just used for this plot
+
+NChain = length(PT_results$temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = NA
+for(sample_use in 1:Nsam){
+  index = sample(floor(niter/2):niter, size = 1)
+  data_infill = data
+  if(length(PT_results$DTP0_index)>0){data_infill[1,] = PT_results$theta[[NChain]][index,PT_results$DTP0_index]}
+  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
+  inds_keep[sample_use] = index
+  for(time_index in (P+1):nrow(data)){
+    prop_model = model_propagate(PT_results$theta[[NChain]][index,],PT_results$sigma2[[NChain]][index],data_infill[(1:time_index-1),],P = 1)$prediction
+    data_infill[time_index,] = prop_model
+    for(variable in 1:length(prop_model)){
+      datafull[[variable]][sample_use, time_index] = prop_model[variable,1]
+    }
+  }
+}
+
+for(country in 1:length(countries2use)){
+matplot(x = dates_in_use,
+  t(datafull[[country]]), 
+        type = 'l',  
+        main = paste("posterior predictive fit for country",
+                                                          colnames(data)[country]))
+points(x = dates_in_use,
+       data[,country], 
+       pch = "*", cex = 3, col= "red")
+}
+
+```
+
+If a topic is non-stationary over this time duration then time series will aim for the _wilder_ behaviour and consider it typical over the _calmer_ time frame.  Time series will really just be honest about uncertainty with the goal of making predictions at the expense of modelling inference.
+
+```{r}
+#| code-fold: true
+#Check sampling:
+
+# logposterior
+LP = data.frame(logpost = unlist(PT_results$log_posterior),
+   temp = as.character(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2))
+LP|>
+  filter(index  %% 5 ==0) |>
+  ggplot()+
+  geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
+  ggtitle("Log unnormalized posterior")
+```
+
+
+If the model variance term has a posterior centered on the data variance it suggests that there is no signal being modelled.  Another way to check this is by examining the posterior distributions for the parameters.
+
+
+```{r}
+#| code-fold: true
+
+
+# sigma2
+PT_results$sigma2[[which(temperatures ==1)]]|> summary()
+LP = data.frame(sigma2 = unlist(PT_results$sigma2),
+   temp = factor(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2))
+LP|>
+  ggplot()+
+  geom_density(aes(x = sigma2, colour = temp), alpha = .25)+
+  ggtitle("Sigma^2, with vertical line at the data variance")+
+  geom_vline(xintercept = 
+         var(c(data_full$data),na.rm=TRUE)
+             )+
+  facet_wrap(~temp, scale = "free")
+
+```
+
+If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero.  However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
+
+```{r}
+#| code-fold: true
+
+
+# theta
+LP =
+  lapply(PT_results$theta, function(x){x|> 
+      as_tibble()|>
+      pivot_longer(everything(),names_to = "par", values_to = "val")|>
+  mutate(index = rep(1:niter, each = ncol(x)))
+    })
+
+stacked = NULL
+for(chain in 1:length(temperatures)){
+  stacked = stacked |> 
+    bind_rows(LP[[chain]] |> 
+                mutate(temp = as.factor(temperatures[chain])))
+}
+stacked |> 
+  filter(index>floor(niter/2))|>
+  filter(str_detect(par, pattern = "^A" ))|>
+  ggplot()+
+  geom_density(aes(x = val, group = temp, colour = temp ))+
+  facet_wrap(~par) + ggtitle("thetas, A")
+
+
+stacked |> 
+    filter(index>floor(niter/2))|>
+    filter(str_detect(par, pattern = "^B" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    facet_wrap(~par) + ggtitle("thetas, B")
+
+
+stacked |> 
+    filter(index>floor(niter/2))|>
+    filter(str_detect(par, pattern = "^C" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+```
+
+:::
 
 
 
