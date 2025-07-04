@@ -210,7 +210,7 @@ Run the MCMC.
 
 ```{r MCMC}
 #| code-fold: true
-
+#| eval: false
 
 
 filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
@@ -251,56 +251,95 @@ save.image(filename)
 
 ## Make some plots:
 
-As always, discard the part of the MCMC where I was adapting the chains:
+As always, discard the part of the MCMC where I was adapting the chains.
+
+
+
+
+
+::: panel-tabset
+
+```{r}
+#| echo: false
+
+topic_of_interest = candidate_topics[1]
+filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+
+```
+
+## Topic `r topic_of_interest`
+
+Results loop over the topics of interest and rely on having run the above code set across different topics.
+
+```{r}
+#| code-fold: true
+print(filename)
+load(filename)
+
+```
 
 
 ```{r}
+#| code-fold: true
+#| output: asis
 
 
-
-
-
-
+A_index        = PT_results$theta_labels |> grep(pattern = "^A")
+B_index        = PT_results$theta_labels |> grep(pattern = "^B")
+C_index        = PT_results$theta_labels |> grep(pattern = "^C")
+sigma2_delta_index    = PT_results$theta_labels |> grep(pattern = "sigma2_delta")
+sigma2_e_index = PT_results$theta_labels |> grep(pattern = "sigma2_e")
+pa_index       = PT_results$theta_labels |> grep(pattern = "^pa")
+X0_index       = PT_results$theta_labels |> grep(pattern = "^X0")
+  
+  
 Nsam = 1000
 
 NChain = length(temperatures)
 datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
 logpost_samp = NA
+inds_keep = sample(floor(niter/2):niter, size = Nsam)
+
+NChain = length(PT_results$temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
 inds_keep = NA
 for(sample_use in 1:Nsam){
   index = sample(floor(niter/2):niter, size = 1)
-  data_infill = data
-  if(length(DTP0_index)>0){data_infill[1,] = PT_results$theta[[NChain]][index,DTP0_index]}
   logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
   inds_keep[sample_use] = index
-  for(time_index in (P+1):nrow(data)){
-    prop_model = model_propagate(PT_results$theta[[NChain]][index,],PT_results$sigma2[[NChain]][index],data_infill[(1:time_index-1),],P = 1)$prediction
-    data_infill[time_index,] = prop_model
-    for(variable in 1:length(prop_model)){
-      datafull[[variable]][sample_use, time_index] = prop_model[variable,1]
+  prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
+                                  theta_labels,
+                                  data, 
+                                  P = 1)$X_full
+  for(variable in 1:ncol(data)){
+      datafull[[variable]][sample_use, ] = prop_model[,variable]
     }
-  }
 }
 
-matplot(t(datafull[[1]]), type = 'l', ylim= c(-.5,.5), main = "posterior predictive")
-points(data[,1], pch = "*", cex = 3, col= "red")
 
-pairs(cbind(logpost_samp, datafull[[1]][,nrow(data)],datafull[[2]][,nrow(data)],datafull[[3]][,nrow(data)],datafull[[4]][,nrow(data)]))
-plot(logpost_samp, datafull[[1]][,nrow(data)])
+for(country in 1:length(countries2use)){
+matplot(x = dates_in_use,
+  t(datafull[[country]]), 
+        type = 'l',  
+        main = paste("posterior predictive fit for country",
+                                                          colnames(data)[country]))
+points(x = dates_in_use,
+       data[,country], 
+       pch = "*", cex = 3, col= "red")
+}
 
-matplot(t(datafull[[1]]), type = 'l', ylim= c(-2,2))
-points(data[,1], pch = "*", cex = 3, col= "red")
-pairs(cbind(logpost_samp, datafull[[1]][,nrow(data)],datafull[[2]][,nrow(data)])
-plot(inds_keep,logpost_samp)
-plot(inds_keep,datafull[[1]][,nrow(data)])
-
-
-
-
+```
 
 
 
+If a topic is non-stationary over this time duration then time series will aim for the wilder behaviour and consider it typical over the calmer time frame. Time series will really just be honest about uncertainty with the goal of making predictions at the expense of modelling inference.
 
+
+
+```{r}
+#| code-fold: true
+#| output: asis
 
 #Check sampling:
 
@@ -314,25 +353,43 @@ LP|>
   geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
   ggtitle("Log unnormalized posterior")
 
+
+```
+
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
 # sigma2
-LP = data.frame(sigma2 = unlist(PT_results$sigma2),
-   temp = factor(rep(temperatures, each = niter)),
-        index = rep(1:niter,  length(temperatures)))|> filter(index>floor(niter/5))
+
+print("sigma2_delta")
+PT_results$theta[[which(temperatures ==1)]][,"sigma2_delta"]|> summary()
+print("sigma2_e")
+PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
+
+
+LP = data.frame(sigma2_delta = PT_results$theta[[1]][,"sigma2_delta"],
+                sigma2_e = PT_results$theta[[1]][,"sigma2_e"],
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2)) |>
+  pivot_longer(cols = starts_with("sigma2"), names_to = "sigma2", values_to = "value")
 LP|>
   ggplot()+
-  geom_density(aes(x = sigma2, colour = temp), alpha = .25)+
-  ggtitle("Sigma^2")
+  geom_density(aes(x = value, color = sigma2))+
+  facet_wrap(~sigma2, scales = "free")
 
 
+```
 
-# sigma2
-LP = data.frame(sigma2 = unlist(PT_results$sigma2),
-   temp = factor(rep(temperatures, each = niter)),
-   index = rep(1:niter,  length(temperatures)))|> filter(index>floor(niter/5))
-LP|>
-    ggplot()+
-    geom_line(aes(y = sigma2, x = index, color = temp), alpha = .5)+
-    ggtitle("Sigma2^")
+
+If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero. However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
+
+
+```{r}
+#| code-fold: true
+#| output: asis
 
 # theta
 LP =
@@ -373,10 +430,6 @@ stacked |>
 
 
 
-boxplot(PT_results$DTP_missing[[NChain]][(niter/2):niter,], main = "missing values")
-
-
-
 ```
 
 
@@ -384,9 +437,8 @@ boxplot(PT_results$DTP_missing[[NChain]][(niter/2):niter,], main = "missing valu
 
 ## Running this on real data:
 
-- Real data will probably work using this code.  If values go beyond [0,1] then a transformation will need to be performed or the model adapted.
-- A real value for **niter** will be something more like 10,000 but more is better.  Expect the code to take a while.  Yes my code could be made more efficient, but piloting code with a small number of iterations, then just letting it run overnight is a very appropriate solution.
-- Another reasonable solution is to push the log posterior into an optimizer and extract the max and the second derivative of the log posterior with respect to the parameters.  Use the inverse second deriv as the starting point for the transition variance (**step\_var**).  That way it handles the correlation structure.  When I do that, I typically scale back the correlation somewhat before using.  You'll also need to replace the **rnorm** with a multivariate Gaussian sampler.
+- Expect the code to take around 8 hours for 50k iterations.  Yes my code could be made more efficient using Sequential Monte Carlo. This is a more appropriate strategy, but parallel tempering is notably difficult to break.  Futhermore, if left to run for a really long time,  Metropolis Hastings types of algorithms are guaranteed to converge to the target posterior under mmild conditions. 
+- Another reasonable solution is to go fully frequentist and optimize the marginal likelihood by integrating over the nuissance states **X** using Integrated Nested Laplace Approximation.  The package **tmb** is designed to do this quickly.
 - Use the script to extract the R code, because this will take a while to run. Note that the script will need to be adjusted because this quarto file generates some fake data.
 
 ```{r purl}
@@ -396,8 +448,3 @@ knitr::purl("Data_PTmodelling_state_space.qmd")
 
 
 ```
-
-
-## Future Work
-
-Sequentially constrained monte carlo would be a much more efficient sampling tool here rather than parallel tempering. 
