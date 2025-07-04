@@ -434,6 +434,735 @@ stacked |>
 
 
 
+```{r}
+#| echo: false
+
+topic_of_interest = candidate_topics[2]
+filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+
+```
+
+## Topic `r topic_of_interest`
+
+Results loop over the topics of interest and rely on having run the above code set across different topics.
+
+```{r}
+#| code-fold: true
+print(filename)
+load(filename)
+
+```
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+
+A_index        = PT_results$theta_labels |> grep(pattern = "^A")
+B_index        = PT_results$theta_labels |> grep(pattern = "^B")
+C_index        = PT_results$theta_labels |> grep(pattern = "^C")
+sigma2_delta_index    = PT_results$theta_labels |> grep(pattern = "sigma2_delta")
+sigma2_e_index = PT_results$theta_labels |> grep(pattern = "sigma2_e")
+pa_index       = PT_results$theta_labels |> grep(pattern = "^pa")
+X0_index       = PT_results$theta_labels |> grep(pattern = "^X0")
+  
+  
+Nsam = 1000
+
+NChain = length(temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = sample(floor(niter/2):niter, size = Nsam)
+
+NChain = length(PT_results$temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = NA
+for(sample_use in 1:Nsam){
+  index = sample(floor(niter/2):niter, size = 1)
+  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
+  inds_keep[sample_use] = index
+  prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
+                                  theta_labels,
+                                  data, 
+                                  P = 1)$X_full
+  for(variable in 1:ncol(data)){
+      datafull[[variable]][sample_use, ] = prop_model[,variable]
+    }
+}
+
+
+for(country in 1:length(countries2use)){
+matplot(x = dates_in_use,
+  t(datafull[[country]]), 
+        type = 'l',  
+        main = paste("posterior predictive fit for country",
+                                                          colnames(data)[country]))
+points(x = dates_in_use,
+       data[,country], 
+       pch = "*", cex = 3, col= "red")
+}
+
+```
+
+
+
+If a topic is non-stationary over this time duration then time series will aim for the wilder behaviour and consider it typical over the calmer time frame. Time series will really just be honest about uncertainty with the goal of making predictions at the expense of modelling inference.
+
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+#Check sampling:
+
+# logposterior
+LP = data.frame(logpost = unlist(PT_results$log_posterior),
+   temp = as.character(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> filter(index>floor(niter/50))
+LP|>
+  filter(index  %% 5 ==0) |>
+  ggplot()+
+  geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
+  ggtitle("Log unnormalized posterior")
+
+
+```
+
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+# sigma2
+
+print("sigma2_delta")
+PT_results$theta[[which(temperatures ==1)]][,"sigma2_delta"]|> summary()
+print("sigma2_e")
+PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
+
+
+LP = data.frame(sigma2_delta = PT_results$theta[[1]][,"sigma2_delta"],
+                sigma2_e = PT_results$theta[[1]][,"sigma2_e"],
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2)) |>
+  pivot_longer(cols = starts_with("sigma2"), names_to = "sigma2", values_to = "value")
+LP|>
+  ggplot()+
+  geom_density(aes(x = value, color = sigma2))+
+  facet_wrap(~sigma2, scales = "free")
+
+
+```
+
+
+If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero. However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+# theta
+LP =
+  lapply(PT_results$theta, function(x){x|> 
+      as_tibble()|>
+      pivot_longer(everything(),names_to = "par", values_to = "val")|>
+  mutate(index = rep(1:niter, each = ncol(x)))
+    })
+
+stacked = NULL
+for(chain in 1:length(temperatures)){
+  stacked = stacked |> 
+    bind_rows(LP[[chain]] |> 
+                mutate(temp = as.factor(temperatures[chain])))
+}
+stacked |> 
+  filter(index>floor(niter/5))|>
+  filter(str_detect(par, pattern = "^A" ))|>
+  ggplot()+
+  geom_density(aes(x = val, group = temp, colour = temp ))+
+  facet_wrap(~par) + ggtitle("thetas, A")
+
+
+stacked |> 
+    filter(index>floor(niter/5))|>
+    filter(str_detect(par, pattern = "^B" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    facet_wrap(~par) + ggtitle("thetas, B")
+
+
+stacked |> 
+    filter(index>floor(niter/5))|>
+    filter(str_detect(par, pattern = "^C" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+
+
+
+```
+
+
+
+
+
+
+
+```{r}
+#| echo: false
+
+topic_of_interest = candidate_topics[3]
+filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+
+```
+
+## Topic `r topic_of_interest`
+
+Results loop over the topics of interest and rely on having run the above code set across different topics.
+
+```{r}
+#| code-fold: true
+print(filename)
+load(filename)
+
+```
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+
+A_index        = PT_results$theta_labels |> grep(pattern = "^A")
+B_index        = PT_results$theta_labels |> grep(pattern = "^B")
+C_index        = PT_results$theta_labels |> grep(pattern = "^C")
+sigma2_delta_index    = PT_results$theta_labels |> grep(pattern = "sigma2_delta")
+sigma2_e_index = PT_results$theta_labels |> grep(pattern = "sigma2_e")
+pa_index       = PT_results$theta_labels |> grep(pattern = "^pa")
+X0_index       = PT_results$theta_labels |> grep(pattern = "^X0")
+  
+  
+Nsam = 1000
+
+NChain = length(temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = sample(floor(niter/2):niter, size = Nsam)
+
+NChain = length(PT_results$temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = NA
+for(sample_use in 1:Nsam){
+  index = sample(floor(niter/2):niter, size = 1)
+  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
+  inds_keep[sample_use] = index
+  prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
+                                  theta_labels,
+                                  data, 
+                                  P = 1)$X_full
+  for(variable in 1:ncol(data)){
+      datafull[[variable]][sample_use, ] = prop_model[,variable]
+    }
+}
+
+
+for(country in 1:length(countries2use)){
+matplot(x = dates_in_use,
+  t(datafull[[country]]), 
+        type = 'l',  
+        main = paste("posterior predictive fit for country",
+                                                          colnames(data)[country]))
+points(x = dates_in_use,
+       data[,country], 
+       pch = "*", cex = 3, col= "red")
+}
+
+```
+
+
+
+If a topic is non-stationary over this time duration then time series will aim for the wilder behaviour and consider it typical over the calmer time frame. Time series will really just be honest about uncertainty with the goal of making predictions at the expense of modelling inference.
+
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+#Check sampling:
+
+# logposterior
+LP = data.frame(logpost = unlist(PT_results$log_posterior),
+   temp = as.character(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> filter(index>floor(niter/50))
+LP|>
+  filter(index  %% 5 ==0) |>
+  ggplot()+
+  geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
+  ggtitle("Log unnormalized posterior")
+
+
+```
+
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+# sigma2
+
+print("sigma2_delta")
+PT_results$theta[[which(temperatures ==1)]][,"sigma2_delta"]|> summary()
+print("sigma2_e")
+PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
+
+
+LP = data.frame(sigma2_delta = PT_results$theta[[1]][,"sigma2_delta"],
+                sigma2_e = PT_results$theta[[1]][,"sigma2_e"],
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2)) |>
+  pivot_longer(cols = starts_with("sigma2"), names_to = "sigma2", values_to = "value")
+LP|>
+  ggplot()+
+  geom_density(aes(x = value, color = sigma2))+
+  facet_wrap(~sigma2, scales = "free")
+
+
+```
+
+
+If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero. However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+# theta
+LP =
+  lapply(PT_results$theta, function(x){x|> 
+      as_tibble()|>
+      pivot_longer(everything(),names_to = "par", values_to = "val")|>
+  mutate(index = rep(1:niter, each = ncol(x)))
+    })
+
+stacked = NULL
+for(chain in 1:length(temperatures)){
+  stacked = stacked |> 
+    bind_rows(LP[[chain]] |> 
+                mutate(temp = as.factor(temperatures[chain])))
+}
+stacked |> 
+  filter(index>floor(niter/5))|>
+  filter(str_detect(par, pattern = "^A" ))|>
+  ggplot()+
+  geom_density(aes(x = val, group = temp, colour = temp ))+
+  facet_wrap(~par) + ggtitle("thetas, A")
+
+
+stacked |> 
+    filter(index>floor(niter/5))|>
+    filter(str_detect(par, pattern = "^B" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    facet_wrap(~par) + ggtitle("thetas, B")
+
+
+stacked |> 
+    filter(index>floor(niter/5))|>
+    filter(str_detect(par, pattern = "^C" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+#| echo: false
+
+topic_of_interest = candidate_topics[4]
+filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+
+```
+
+## Topic `r topic_of_interest`
+
+Results loop over the topics of interest and rely on having run the above code set across different topics.
+
+```{r}
+#| code-fold: true
+print(filename)
+load(filename)
+
+```
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+
+A_index        = PT_results$theta_labels |> grep(pattern = "^A")
+B_index        = PT_results$theta_labels |> grep(pattern = "^B")
+C_index        = PT_results$theta_labels |> grep(pattern = "^C")
+sigma2_delta_index    = PT_results$theta_labels |> grep(pattern = "sigma2_delta")
+sigma2_e_index = PT_results$theta_labels |> grep(pattern = "sigma2_e")
+pa_index       = PT_results$theta_labels |> grep(pattern = "^pa")
+X0_index       = PT_results$theta_labels |> grep(pattern = "^X0")
+  
+  
+Nsam = 1000
+
+NChain = length(temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = sample(floor(niter/2):niter, size = Nsam)
+
+NChain = length(PT_results$temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = NA
+for(sample_use in 1:Nsam){
+  index = sample(floor(niter/2):niter, size = 1)
+  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
+  inds_keep[sample_use] = index
+  prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
+                                  theta_labels,
+                                  data, 
+                                  P = 1)$X_full
+  for(variable in 1:ncol(data)){
+      datafull[[variable]][sample_use, ] = prop_model[,variable]
+    }
+}
+
+
+for(country in 1:length(countries2use)){
+matplot(x = dates_in_use,
+  t(datafull[[country]]), 
+        type = 'l',  
+        main = paste("posterior predictive fit for country",
+                                                          colnames(data)[country]))
+points(x = dates_in_use,
+       data[,country], 
+       pch = "*", cex = 3, col= "red")
+}
+
+```
+
+
+
+If a topic is non-stationary over this time duration then time series will aim for the wilder behaviour and consider it typical over the calmer time frame. Time series will really just be honest about uncertainty with the goal of making predictions at the expense of modelling inference.
+
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+#Check sampling:
+
+# logposterior
+LP = data.frame(logpost = unlist(PT_results$log_posterior),
+   temp = as.character(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> filter(index>floor(niter/50))
+LP|>
+  filter(index  %% 5 ==0) |>
+  ggplot()+
+  geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
+  ggtitle("Log unnormalized posterior")
+
+
+```
+
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+# sigma2
+
+print("sigma2_delta")
+PT_results$theta[[which(temperatures ==1)]][,"sigma2_delta"]|> summary()
+print("sigma2_e")
+PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
+
+
+LP = data.frame(sigma2_delta = PT_results$theta[[1]][,"sigma2_delta"],
+                sigma2_e = PT_results$theta[[1]][,"sigma2_e"],
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2)) |>
+  pivot_longer(cols = starts_with("sigma2"), names_to = "sigma2", values_to = "value")
+LP|>
+  ggplot()+
+  geom_density(aes(x = value, color = sigma2))+
+  facet_wrap(~sigma2, scales = "free")
+
+
+```
+
+
+If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero. However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+# theta
+LP =
+  lapply(PT_results$theta, function(x){x|> 
+      as_tibble()|>
+      pivot_longer(everything(),names_to = "par", values_to = "val")|>
+  mutate(index = rep(1:niter, each = ncol(x)))
+    })
+
+stacked = NULL
+for(chain in 1:length(temperatures)){
+  stacked = stacked |> 
+    bind_rows(LP[[chain]] |> 
+                mutate(temp = as.factor(temperatures[chain])))
+}
+stacked |> 
+  filter(index>floor(niter/5))|>
+  filter(str_detect(par, pattern = "^A" ))|>
+  ggplot()+
+  geom_density(aes(x = val, group = temp, colour = temp ))+
+  facet_wrap(~par) + ggtitle("thetas, A")
+
+
+stacked |> 
+    filter(index>floor(niter/5))|>
+    filter(str_detect(par, pattern = "^B" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    facet_wrap(~par) + ggtitle("thetas, B")
+
+
+stacked |> 
+    filter(index>floor(niter/5))|>
+    filter(str_detect(par, pattern = "^C" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+#| echo: false
+
+topic_of_interest = candidate_topics[5]
+filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+
+```
+
+## Topic `r topic_of_interest`
+
+Results loop over the topics of interest and rely on having run the above code set across different topics.
+
+```{r}
+#| code-fold: true
+print(filename)
+load(filename)
+
+```
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+
+A_index        = PT_results$theta_labels |> grep(pattern = "^A")
+B_index        = PT_results$theta_labels |> grep(pattern = "^B")
+C_index        = PT_results$theta_labels |> grep(pattern = "^C")
+sigma2_delta_index    = PT_results$theta_labels |> grep(pattern = "sigma2_delta")
+sigma2_e_index = PT_results$theta_labels |> grep(pattern = "sigma2_e")
+pa_index       = PT_results$theta_labels |> grep(pattern = "^pa")
+X0_index       = PT_results$theta_labels |> grep(pattern = "^X0")
+  
+  
+Nsam = 1000
+
+NChain = length(temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = sample(floor(niter/2):niter, size = Nsam)
+
+NChain = length(PT_results$temperatures)
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+logpost_samp = NA
+inds_keep = NA
+for(sample_use in 1:Nsam){
+  index = sample(floor(niter/2):niter, size = 1)
+  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
+  inds_keep[sample_use] = index
+  prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
+                                  theta_labels,
+                                  data, 
+                                  P = 1)$X_full
+  for(variable in 1:ncol(data)){
+      datafull[[variable]][sample_use, ] = prop_model[,variable]
+    }
+}
+
+
+for(country in 1:length(countries2use)){
+matplot(x = dates_in_use,
+  t(datafull[[country]]), 
+        type = 'l',  
+        main = paste("posterior predictive fit for country",
+                                                          colnames(data)[country]))
+points(x = dates_in_use,
+       data[,country], 
+       pch = "*", cex = 3, col= "red")
+}
+
+```
+
+
+
+If a topic is non-stationary over this time duration then time series will aim for the wilder behaviour and consider it typical over the calmer time frame. Time series will really just be honest about uncertainty with the goal of making predictions at the expense of modelling inference.
+
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+#Check sampling:
+
+# logposterior
+LP = data.frame(logpost = unlist(PT_results$log_posterior),
+   temp = as.character(rep(temperatures, each = niter)),
+        index = rep(1:niter,  length(temperatures)))|> filter(index>floor(niter/50))
+LP|>
+  filter(index  %% 5 ==0) |>
+  ggplot()+
+  geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
+  ggtitle("Log unnormalized posterior")
+
+
+```
+
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+# sigma2
+
+print("sigma2_delta")
+PT_results$theta[[which(temperatures ==1)]][,"sigma2_delta"]|> summary()
+print("sigma2_e")
+PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
+
+
+LP = data.frame(sigma2_delta = PT_results$theta[[1]][,"sigma2_delta"],
+                sigma2_e = PT_results$theta[[1]][,"sigma2_e"],
+        index = rep(1:niter,  length(temperatures)))|> 
+  filter(index>floor(niter/2)) |>
+  pivot_longer(cols = starts_with("sigma2"), names_to = "sigma2", values_to = "value")
+LP|>
+  ggplot()+
+  geom_density(aes(x = value, color = sigma2))+
+  facet_wrap(~sigma2, scales = "free")
+
+
+```
+
+
+If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero. However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
+
+
+```{r}
+#| code-fold: true
+#| output: asis
+
+# theta
+LP =
+  lapply(PT_results$theta, function(x){x|> 
+      as_tibble()|>
+      pivot_longer(everything(),names_to = "par", values_to = "val")|>
+  mutate(index = rep(1:niter, each = ncol(x)))
+    })
+
+stacked = NULL
+for(chain in 1:length(temperatures)){
+  stacked = stacked |> 
+    bind_rows(LP[[chain]] |> 
+                mutate(temp = as.factor(temperatures[chain])))
+}
+stacked |> 
+  filter(index>floor(niter/5))|>
+  filter(str_detect(par, pattern = "^A" ))|>
+  ggplot()+
+  geom_density(aes(x = val, group = temp, colour = temp ))+
+  facet_wrap(~par) + ggtitle("thetas, A")
+
+
+stacked |> 
+    filter(index>floor(niter/5))|>
+    filter(str_detect(par, pattern = "^B" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    facet_wrap(~par) + ggtitle("thetas, B")
+
+
+stacked |> 
+    filter(index>floor(niter/5))|>
+    filter(str_detect(par, pattern = "^C" ))|>
+    ggplot()+
+    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+
+
+
+```
+
+:::
+
 
 ## Running this on real data:
 
