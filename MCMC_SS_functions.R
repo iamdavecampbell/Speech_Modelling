@@ -699,8 +699,8 @@ model_propagate_SS = function(theta,theta_labels, Xstep_minus_P,P = 1){
   # so that we take in the most recently evaluated Xstep_minus_P and put the lagged version in the right place
   error = rnorm(J,mean = 0,sd = sqrt(theta[sigma2_delta_index])) |> matrix(nrow = P)
   predicted_mean = a + 
-    apply(b*Xstep_minus_P,1,sum) + # sum down columns if P>1
-    t(cmat %*% (1+0*Xstep_minus_P[nrow(Xstep_minus_P),]))
+    apply(b*Xstep_minus_P,2,sum) + # sum down columns if P>1
+    t(cmat %*% Xstep_minus_P[nrow(Xstep_minus_P),])
   return(list(predicted_mean = predicted_mean,
               error = error,
               prediction = predicted_mean+error))
