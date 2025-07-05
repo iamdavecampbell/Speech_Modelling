@@ -10,6 +10,17 @@ $$DTP_{ijt} = a_j + \sum_pb_{jp} * DTP_{ijt-p} + \sum_{k\in \{1,...,J\} \setminu
 - Data_PTModelling.qmd = runs MCMC on data
 
 
+## State Space Formulation:
 
+Observation process
+
+
+$$DTP_{ijt} = \alpha_{ijt} \left[X_{ijt} + e_{i,j,t}\right], \ \ \ where\ \ \ e_{ijt}\sim N(0,\sigma^2_{e,i}), \ \ \ and \ \ \ \alpha_{ijt} \sim Bernoulli(p_a)$$
+
+ Un-observable Transition process:
+
+Dropping the reliance on the topic index _i_, the model transitions ahead based on the  stochastic process: 
+
+$$X_{jt} = a_j+b_{j} * X_{jt-1} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * X_{kt-1}+ \delta_{jt}.$$
 
 
