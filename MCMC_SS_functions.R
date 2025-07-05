@@ -121,7 +121,12 @@ Run_PT_SS = function(niter,  #MCMC iterations
   if(!is.list(CCor)){CCor                   = rep(list(CCor),     length(temperatures))}
   X0Cor = rep(list(diag(1,Ncountries)),     length(temperatures)) # initial guess at the latent state correlation
   # set up a starting point, even if it's the raw data with imputed mean.
-  Xstart              = model_predict_SS(theta[[1]][1,],theta_labels,data, P = 1)$X_full
+  Xstart = data
+  Xstart[1,Xstart[1,]==0] = mean(Xstart[1,Xstart[1,]!=0])
+  for(ro in 2:nrow(Xstart)){
+    Xstart[ro,which(is.na(Xstart[ro,]))] = Xstart[ro-1,which(is.na(Xstart[ro,]))] 
+    Xstart[ro,Xstart[ro,]==0]            = Xstart[ro-1,Xstart[ro,]==0] 
+  }
   # build the X matrix by flattening the data matrix, reconstruct the X matrix using:
   # matrix(Xmat[[1]][1,], ncol = J):
   Xmat            = rep(list(rbind(c(Xstart),
@@ -351,10 +356,6 @@ Run_PT_SS = function(niter,  #MCMC iterations
         
       theta_prop = theta_use
       theta_prop[X0_index] = X0prop
-      # conditional on X0, propose a new set of X values:
-      Xout = model_predict_SS(theta_prop,theta_labels,data, P = 1)$X_full
-      
-      
       # the ratio of un-normalized posteriors.  Note that my proposal
       # distribution is symmetric so Q_{ij}=Q_{ji}
       log_post_prop = logpost_SS(theta = theta_prop, 
@@ -362,7 +363,7 @@ Run_PT_SS = function(niter,  #MCMC iterations
                                  data = data,
                                  P = 1,
                                  alphas = alphas,
-                                 X = Xout,
+                                 X = XUse,
                                  temperature = temperatures[chain],
                                  filename = filename,
                                  sigma2_pars = c(delta = .01, e = .0001))  # proposed
@@ -371,10 +372,41 @@ Run_PT_SS = function(niter,  #MCMC iterations
         if(!is.na(logalpha) && runif(1) < exp(logalpha)){
           accepts[[chain]][current_stop,7] = accepts[[chain]][current_stop,7]+1;
           theta_use     = theta_prop
-          XUse          = Xout
           log_post_old  = log_post_prop
         }  
       
+        ##### X* #####
+        # This will be super duper slow since we now have a for loop that moves around every since piece of X
+        # however at least it will allow things to progress.
+        # using the model to rebuild the full trajectory will have terrible sampling properties.
+        
+        for(xindex in 2:nrow(XUse)){
+           Xstarprop = XUse
+           Xstarprop[xindex,]   = rmvnorm(1, mean = XUse[xindex,], 
+                                          sigma = diag(step_var[[chain]][7], length(X0_index))%*%
+                                            X0Cor[[chain]] %*% 
+                                            diag(step_var[[chain]][7], length(X0_index)))
+           # the ratio of un-normalized posteriors.  Note that my proposal
+           # distribution is symmetric so Q_{ij}=Q_{ji}
+           log_post_prop = logpost_SS(theta = theta_prop, 
+                                      theta_labels = theta_labels,
+                                      data = data,
+                                      P = 1,
+                                      alphas = alphas,
+                                      X = Xstarprop,
+                                      temperature = temperatures[chain],
+                                      filename = filename,
+                                      sigma2_pars = c(delta = .01, e = .0001))  # proposed
+           logalpha =   log_post_prop - log_post_old 
+           
+           if(!is.na(logalpha) && runif(1) < exp(logalpha)){
+             # not tracking acceptance rates here.  It's a lot to carry around.
+             # accepts[[chain]][current_stop,7] = accepts[[chain]][current_stop,7]+1;
+             XUse          = Xstarprop
+             log_post_old  = log_post_prop
+           }  
+        }
+        
       ##### pa #####
       # propose a value from an easy distribution
       paprop               = rtruncnorm(n = Number_of_pa, 

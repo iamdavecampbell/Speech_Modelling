@@ -8,6 +8,19 @@ format:
 ---
 
 
+## Basics
+
+```{r version}
+#| code-fold: true
+version
+library(tidyverse)
+library(lubridate)
+library(truncnorm)
+library(mvtnorm)
+# import main functions
+source("MCMC_SS_functions.R")     # Main Metropolis Hasting for vectorized state space model
+```
+
 
 ## State Space Model:
 
@@ -22,24 +35,24 @@ A state space formulation implies that there is some stochastic process for the 
 #### Observation process:
 
 
-$$DTP_{ijt} = \alpha_{ijt} \left[X_{ijt} + e_{i,j,t}\right], \ \ \ where\ \ \ e_{ijt}\sim N(0,\sigma^2_{e,i}),$$
+$$DTP_{ijt} = \alpha_{ijt} \left[X_{ijt} + e_{i,j,t}\right], \ \ \ where\ \ \ e_{ijt}\sim N(0,\sigma^2_{e,i}), \ \ \ and \ \ \ \alpha_{ijt} \sim Bernoulli(p_a)$$
 
-The observation process has the moments:
+<!-- The observation process has the moments: -->
 
-$$E(DTP_{ijt}\mid X_{ijt}) = \alpha_{ijt} X_{ijt}$$
+<!-- $$E(DTP_{ijt}\mid X_{ijt}) = \alpha_{ijt} X_{ijt}$$ -->
 To control whether or not the observation occurs we use $\alpha_{ijt}\in\{0,1\}$ where  $\alpha_{ijt} \sim Bernoulli(p_a)$.
 
 
-$$var(DTP_{ijt}\mid X_{ijt}, \alpha_{ijt}=1) = \sigma^2_{\epsilon,i}$$
-$$var(DTP_{ijt}\mid X_{ijt}, \alpha_{ijt}=0) = 0$$
+<!-- $$var(DTP_{ijt}\mid X_{ijt}, \alpha_{ijt}=1) = \sigma^2_{\epsilon,i}$$ -->
+<!-- $$var(DTP_{ijt}\mid X_{ijt}, \alpha_{ijt}=0) = 0$$ -->
 
 
 
 #### Un-observable Transition process:
 
-Dropping the reliance on the topic index _i_, the model transitions ahead based on the following stochastic process. 
+Dropping the reliance on the topic index _i_, the model transitions ahead based on the  stochastic process: 
 
-$$X_{jt} = a_j+b_{j} * X_{jt-1} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * X_{kt-1}+ \delta_{jt}$$
+$$X_{jt} = a_j+b_{j} * X_{jt-1} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * X_{kt-1}+ \delta_{jt}.$$
 Using matrix notation this can be handled with an appropriately defined $\Theta$ and by expanding $X_{jt-1}$ to include a column of 1s.
 $$= \Theta X_{jt-1}+ \delta_{jt}, \ \ \ where\ \ \ \delta_{jt}\sim N(0,\sigma_{\delta}^2).$$
 
@@ -54,10 +67,10 @@ And $X_{jt}\mid X_{jt-1}\sim N(\Theta X, \sigma^2_{\delta})$.
 
 
 
-However, using the matrix notation we can re-write moments for the observation process
+Using the matrix notation we can re-write moments for the observation process
 $$E(DTP_{jt}\mid X_{jt-1}) = \alpha \Theta X_{jt}$$
 
-But we already know the values of $\alpha_{jt} \in\{0,1\}$ which tracks the observed zeros or ones, such that $\alpha_{jt}\sim Bernoulli (p_a)$.   **In a future version**, it will be useful to set up $p_a$ to be time varying, allowing for topics like covid and the unprovoked invasion of Ukraine to be turned off / on.  
+But we already know the values of $\alpha_{jt} \in\{0,1\}$ which tracks the observed zeros or ones, such that $\alpha_{jt}\sim Bernoulli (p_a)$.   **In a future version**, maybe we set up $p_a$ to be time varying, allowing for topics like covid and the unprovoked invasion of Ukraine to be turned off / on.  
 When we observe zero for this topic or we do not observe a speech, then we have $\alpha_{jt}=0$ and $\alpha_{jt}=1$ otherwise.
 
 
@@ -78,22 +91,6 @@ We could use a Laplace Approximation to integrate out the nuissance parameters $
 Include priors on structural parameters $X_{ij0},\Theta, p_a, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}$, then sample from the joint posterior of all structural parameters and the nuissance parameters.  Discard the samples from the nuissance parameters to marginalize / integrate them out leaving a sample from $P(X_{ij0},\Theta, \alpha, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i} \mid DTP_{ij1},...,DTP_{ijt})$.   The sampler may be inefficient and take a while to converge unless you get fancy.  Here we get fancy by using Parallel Tempering. 
 
 
-
-## Basics
-
-Note, when running as a script, we can define **niter**, **nstops**, and the saving **filename** externally.
-Defaults, if not provided are: niter = 50000;nstops = 100; filename = "realdata_interim_results2.Rdata"
-
-```{r version}
-#| code-fold: true
-version
-library(tidyverse)
-library(lubridate)
-library(truncnorm)
-library(mvtnorm)
-# import main functions
-source("MCMC_SS_functions.R")     # Main Metropolis Hasting for vectorized state space model
-```
 
 
 
@@ -128,7 +125,7 @@ datafile   = paste0(datafolder,"nmf-time-series-g20.csv")
 
 #2. topic of interest
 candidate_topics = c("inflat" ,"brexit", "covid", "cbdc", "ukrain" )
-(topic_of_interest = candidate_topics[1])
+(topic_of_interest = candidate_topics[3])
 
 #3 countries to use.  
 # possible option
@@ -140,10 +137,17 @@ countries2use = G7_countries# unique(dataset$country)
 
 #4 first month to use
 start_date = ymd("2008-11-01")
+if(topic_of_interest=="brexit"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="covid"){
+  start_date = ymd("2020-01-01")
+}
+
 
 #5 decision to log (or not log) the dataset.  Note that the data is transformed and the "prefix" is 
 # prefix = "log"   # since using log transformed data.
-prefix = "raw" # if not using log transformed data.
+prefix = "raw_super_slow_" # if not using log transformed data.
 # LOG STUFF IS NOT TESTED SINCE IT REQUIRES SOME ADJUSTMENTS TO PRIORS ON X
 
 ```
@@ -177,10 +181,11 @@ Use Metropolis Hastings.  This will be slow to sample.  In future move to a Sequ
 1. **sample parameters in blocks** $a$ using MH.
 2. **sample parameters in blocks** $b$ using MH.
 3. **sample parameters in blocks** $c$ using MH.  We expect correlations beteen country effects, so these are sampled using multivariate Normal.
-4. **propose** $X_{0}$ and then propagate $X_{t}\mid X_{0}$. Then make a decision for this MH step based on the collective set of $X_{\cdot}$. We expect correlations between starting points for latent states, so these are sampled using multivariate Normal.
-5. **sample** $p_a$ using MH.
-6. **sample** $\sigma^2_\delta$ using MH.
-7. **sample** $\sigma^2_e$ using MH.
+4. **sample** $X_{0}$. We expect correlations between starting points for latent states, so these are sampled using multivariate Normal.
+5. Loop through time points and **sample** $X_{t}$. We expect correlations between starting points for latent states, so these are sampled using multivariate Normal. Eventually we should move to doing the whole thing using SMC.
+6. **sample** $p_a$ using MH.
+7. **sample** $\sigma^2_\delta$ using MH.
+8. **sample** $\sigma^2_e$ using MH.
 
 
 
@@ -271,7 +276,7 @@ filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countrie
 
 Results loop over the topics of interest and rely on having run the above code set across different topics.
 
-```{r}
+```{r top1load}
 #| code-fold: true
 print(filename)
 load(filename)
@@ -279,7 +284,7 @@ load(filename)
 ```
 
 
-```{r}
+```{r top1index}
 #| code-fold: true
 #| output: asis
 
@@ -300,6 +305,9 @@ datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
 logpost_samp = NA
 inds_keep = sample(floor(niter/2):niter, size = Nsam)
 
+
+## replace this given that we store samples of X so we should just use those as is.
+
 NChain = length(PT_results$temperatures)
 datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
 logpost_samp = NA
@@ -309,7 +317,7 @@ for(sample_use in 1:Nsam){
   logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
   inds_keep[sample_use] = index
   prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
-                                  theta_labels,
+                                  PT_results$theta_labels,
                                   data, 
                                   P = 1)$X_full
   for(variable in 1:ncol(data)){
@@ -337,7 +345,7 @@ If a topic is non-stationary over this time duration then time series will aim f
 
 
 
-```{r}
+```{r top1logpost}
 #| code-fold: true
 #| output: asis
 
@@ -387,7 +395,7 @@ LP|>
 If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero. However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
 
 
-```{r}
+```{r top1theta}
 #| code-fold: true
 #| output: asis
 
@@ -434,7 +442,7 @@ stacked |>
 
 
 
-```{r}
+```{r top2start}
 #| echo: false
 
 topic_of_interest = candidate_topics[2]
@@ -446,7 +454,7 @@ filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countrie
 
 Results loop over the topics of interest and rely on having run the above code set across different topics.
 
-```{r}
+```{r top2load}
 #| code-fold: true
 print(filename)
 load(filename)
@@ -454,7 +462,7 @@ load(filename)
 ```
 
 
-```{r}
+```{r top2index}
 #| code-fold: true
 #| output: asis
 
@@ -484,7 +492,7 @@ for(sample_use in 1:Nsam){
   logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
   inds_keep[sample_use] = index
   prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
-                                  theta_labels,
+                                  PT_results$theta_labels,
                                   data, 
                                   P = 1)$X_full
   for(variable in 1:ncol(data)){
@@ -512,7 +520,7 @@ If a topic is non-stationary over this time duration then time series will aim f
 
 
 
-```{r}
+```{r top2samp}
 #| code-fold: true
 #| output: asis
 
@@ -533,7 +541,7 @@ LP|>
 
 
 
-```{r}
+```{r top2sig}
 #| code-fold: true
 #| output: asis
 
@@ -562,7 +570,7 @@ LP|>
 If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero. However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
 
 
-```{r}
+```{r top2theta}
 #| code-fold: true
 #| output: asis
 
@@ -613,7 +621,7 @@ stacked |>
 
 
 
-```{r}
+```{r top3start}
 #| echo: false
 
 topic_of_interest = candidate_topics[3]
@@ -625,7 +633,7 @@ filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countrie
 
 Results loop over the topics of interest and rely on having run the above code set across different topics.
 
-```{r}
+```{r top3load}
 #| code-fold: true
 print(filename)
 load(filename)
@@ -633,7 +641,7 @@ load(filename)
 ```
 
 
-```{r}
+```{r top3index}
 #| code-fold: true
 #| output: asis
 
@@ -663,7 +671,7 @@ for(sample_use in 1:Nsam){
   logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
   inds_keep[sample_use] = index
   prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
-                                  theta_labels,
+                                  PT_results$theta_labels,
                                   data, 
                                   P = 1)$X_full
   for(variable in 1:ncol(data)){
@@ -691,7 +699,7 @@ If a topic is non-stationary over this time duration then time series will aim f
 
 
 
-```{r}
+```{r top3sampl}
 #| code-fold: true
 #| output: asis
 
@@ -741,7 +749,7 @@ LP|>
 If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero. However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
 
 
-```{r}
+```{r top3theta}
 #| code-fold: true
 #| output: asis
 
@@ -798,7 +806,7 @@ stacked |>
 
 
 
-```{r}
+```{r top4start}
 #| echo: false
 
 topic_of_interest = candidate_topics[4]
@@ -810,7 +818,7 @@ filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countrie
 
 Results loop over the topics of interest and rely on having run the above code set across different topics.
 
-```{r}
+```{r top4load}
 #| code-fold: true
 print(filename)
 load(filename)
@@ -818,7 +826,7 @@ load(filename)
 ```
 
 
-```{r}
+```{r top4index}
 #| code-fold: true
 #| output: asis
 
@@ -848,7 +856,7 @@ for(sample_use in 1:Nsam){
   logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
   inds_keep[sample_use] = index
   prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
-                                  theta_labels,
+                                  PT_results$theta_labels,
                                   data, 
                                   P = 1)$X_full
   for(variable in 1:ncol(data)){
@@ -876,7 +884,7 @@ If a topic is non-stationary over this time duration then time series will aim f
 
 
 
-```{r}
+```{r top4samp}
 #| code-fold: true
 #| output: asis
 
@@ -926,7 +934,7 @@ LP|>
 If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero. However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
 
 
-```{r}
+```{r top4theta}
 #| code-fold: true
 #| output: asis
 
@@ -988,7 +996,7 @@ stacked |>
 
 
 
-```{r}
+```{r top5start}
 #| echo: false
 
 topic_of_interest = candidate_topics[5]
@@ -1000,7 +1008,7 @@ filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countrie
 
 Results loop over the topics of interest and rely on having run the above code set across different topics.
 
-```{r}
+```{r top5load}
 #| code-fold: true
 print(filename)
 load(filename)
@@ -1008,7 +1016,7 @@ load(filename)
 ```
 
 
-```{r}
+```{r top5index}
 #| code-fold: true
 #| output: asis
 
@@ -1038,7 +1046,7 @@ for(sample_use in 1:Nsam){
   logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
   inds_keep[sample_use] = index
   prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
-                                  theta_labels,
+                                  PT_results$theta_labels,
                                   data, 
                                   P = 1)$X_full
   for(variable in 1:ncol(data)){
@@ -1087,7 +1095,7 @@ LP|>
 
 
 
-```{r}
+```{r top5sig}
 #| code-fold: true
 #| output: asis
 
@@ -1116,7 +1124,7 @@ LP|>
 If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero. However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
 
 
-```{r}
+```{r top5theta}
 #| code-fold: true
 #| output: asis
 
