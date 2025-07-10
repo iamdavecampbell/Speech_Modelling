@@ -21,11 +21,12 @@ Run_PT_SS = function(niter,  #MCMC iterations
                                            B = .23,
                                            C = .23,
                                            sigma2_delta = .44,
-                                           sigma2_e = .44,
-                                           pa = .44,
-                                           X = .23), # target sampling acceptance rates
+                                           sigma2_e     = .44,
+                                           pa           = .44,
+                                           X            = .23,
+                                           Xstar        = .23), # target sampling acceptance rates
                   filename = NULL,
-                  step_var = rep(0.1,7),# initial guess at transition variance can be user specified.
+                  step_var = rep(0.1,8),# initial guess at transition variance can be user specified.
                   CCor = diag(1, ncol(data)*(ncol(data)-1)),# potential correlation structure for C if known 
                   sigma2_pars = c(delta = .01, e = .0001) # prior parameters for the sigmas.
           ){
@@ -74,7 +75,7 @@ Run_PT_SS = function(niter,  #MCMC iterations
 #
 #
   
-  Nparblocks = 7 #{A,B,C,sigma2_delta, sigma2_e, p_a, X} 
+  Nparblocks = 8 #{A,B,C,sigma2_delta, sigma2_e, p_a, X, Xothers} 
   Ncountries = J = ncol(data) #Ncountries
   Number_of_a = J = ncol(data) # one intercept per country
   Number_of_b = J*P            # cols of B are lag.
@@ -122,10 +123,11 @@ Run_PT_SS = function(niter,  #MCMC iterations
   X0Cor = rep(list(diag(1,Ncountries)),     length(temperatures)) # initial guess at the latent state correlation
   # set up a starting point, even if it's the raw data with imputed mean.
   Xstart = data
-  Xstart[1,Xstart[1,]==0] = mean(Xstart[1,Xstart[1,]!=0])
+  Xstart[1,Xstart[1,]==0] = mean(c(0,Xstart[1,Xstart[1,]!=0]), na.rm = TRUE)
   for(ro in 2:nrow(Xstart)){
     Xstart[ro,which(is.na(Xstart[ro,]))] = Xstart[ro-1,which(is.na(Xstart[ro,]))] 
     Xstart[ro,Xstart[ro,]==0]            = Xstart[ro-1,Xstart[ro,]==0] 
+    # print(Xstart[max(1,ro-5):min((ro+1), nrow(data)),])
   }
   # build the X matrix by flattening the data matrix, reconstruct the X matrix using:
   # matrix(Xmat[[1]][1,], ncol = J):
@@ -383,9 +385,9 @@ Run_PT_SS = function(niter,  #MCMC iterations
         for(xindex in 2:nrow(XUse)){
            Xstarprop = XUse
            Xstarprop[xindex,]   = rmvnorm(1, mean = XUse[xindex,], 
-                                          sigma = diag(step_var[[chain]][7], length(X0_index))%*%
+                                          sigma = diag(step_var[[chain]][8], length(X0_index))%*%
                                             X0Cor[[chain]] %*% 
-                                            diag(step_var[[chain]][7], length(X0_index)))
+                                            diag(step_var[[chain]][8], length(X0_index)))
            # the ratio of un-normalized posteriors.  Note that my proposal
            # distribution is symmetric so Q_{ij}=Q_{ji}
            log_post_prop = logpost_SS(theta = theta_prop, 
@@ -401,8 +403,9 @@ Run_PT_SS = function(niter,  #MCMC iterations
            
            if(!is.na(logalpha) && runif(1) < exp(logalpha)){
              # not tracking acceptance rates here.  It's a lot to carry around.
-             # accepts[[chain]][current_stop,7] = accepts[[chain]][current_stop,7]+1;
+             # accepts[[chain]][current_stop,8] = accepts[[chain]][current_stop,8]+1;
              XUse          = Xstarprop
+             accepts[[chain]][current_stop,8] = accepts[[chain]][current_stop,8]+1/(nrow(XUse)-1); # increment acceptance but scaling it down to the many Xs that are being used.
              log_post_old  = log_post_prop
            }  
         }

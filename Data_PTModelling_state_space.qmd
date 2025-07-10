@@ -4,9 +4,13 @@ format:
   html:
     html-math-method: mathjax
     echo: true
-    eval: false
+    eval: true
 ---
 
+
+## Assessment
+
+State Space models are much better in that they seem to catch some of the dynamics.  This is still running so these results should be considered preliminary.   Mostly the sampling of the system states was not efficiently implemented.  Results to be updated.
 
 ## Basics
 
@@ -56,21 +60,10 @@ $$X_{jt} = a_j+b_{j} * X_{jt-1} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} 
 Using matrix notation this can be handled with an appropriately defined $\Theta$ and by expanding $X_{jt-1}$ to include a column of 1s.
 $$= \Theta X_{jt-1}+ \delta_{jt}, \ \ \ where\ \ \ \delta_{jt}\sim N(0,\sigma_{\delta}^2).$$
 
-The un-observable transition process has the moments:
-
-$$E(X_{jt}\mid X_{jt-1}) = \Theta X_{jt-1}$$
-
-$$var(X_{jt}\mid X_{jt-1}) = \sigma^2_{\delta}$$
-And $X_{jt}\mid X_{jt-1}\sim N(\Theta X, \sigma^2_{\delta})$.
+The un-observable transition process _should_ track the underlying process better than a VAR model because it splits apart the states and observations.  Both will be about the same when it comes to prediction.
 
 
-
-
-
-Using the matrix notation we can re-write moments for the observation process
-$$E(DTP_{jt}\mid X_{jt-1}) = \alpha \Theta X_{jt}$$
-
-But we already know the values of $\alpha_{jt} \in\{0,1\}$ which tracks the observed zeros or ones, such that $\alpha_{jt}\sim Bernoulli (p_a)$.   **In a future version**, maybe we set up $p_a$ to be time varying, allowing for topics like covid and the unprovoked invasion of Ukraine to be turned off / on.  
+Note that we already know the values of $\alpha_{jt} \in\{0,1\}$  but we will model it as $\alpha_{jt}\sim Bernoulli (p_a)$.   **In a future version**, maybe we set up $p_a$ to be time varying, allowing for topics like covid and the unprovoked invasion of Ukraine to be turned off / on.  
 When we observe zero for this topic or we do not observe a speech, then we have $\alpha_{jt}=0$ and $\alpha_{jt}=1$ otherwise.
 
 
@@ -83,12 +76,15 @@ $$P(X_{ijt},\ldots X_{ij0},DTP_{ijt},\ldots,DTP_{ij0}\mid \Theta, p_a, \sigma^2_
 
 $$P(DTP_{ijt},\ldots,DTP_{ij0},\alpha_{jt}\mid \Theta, p_a, \sigma^2_{\epsilon}, \sigma^2_{\delta}) = \int_\chi\cdots\int_\chi P(\alpha\mid p_a)P(X_{j0})\prod_{s=1}^t P(X_{js}\mid X_{js-1} \Theta)\left[P(DTP_{js}\mid\Theta, p_a, \sigma^2_{\epsilon}, \sigma^2_{\delta},X_{js}))\right]^{\alpha_{jt}}dX_{j0}\cdots dX_{jT}$$
 
-We could use a Laplace Approximation to integrate out the nuissance parameters $X$ and the unobserved $DTP$ values to obtain the MLE for $\Theta, \alpha, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}$.  This becomes a numerical optimization routing where the optimizer needs to handle the Laplace approximation at each iteration until the marginal likelihood is optimized.
+### Frequentist Approach: 
+
+We could use a Laplace Approximation to integrate out the nuissance parameters $X$ and the unobserved $DTP$ values to obtain the MLE for $\Theta, \alpha, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}$.  This becomes a numerical optimization routing where the optimizer needs to handle the Laplace approximation at each iteration until the marginal likelihood is optimized.  The R library _TMB_ compiles models in C and runs quickly if you want to try it.
 
 #### Bayesian Approach:
 
+Bayesian tools provide easy access to non-asymptotic uncertainty estimates and readily allow for unspecified correlations between parameters. Bayesian approaches also allow for non-approximate (well, less-approximate) integration for marginal likelihoods.
 
-Include priors on structural parameters $X_{ij0},\Theta, p_a, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}$, then sample from the joint posterior of all structural parameters and the nuissance parameters.  Discard the samples from the nuissance parameters to marginalize / integrate them out leaving a sample from $P(X_{ij0},\Theta, \alpha, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i} \mid DTP_{ij1},...,DTP_{ijt})$.   The sampler may be inefficient and take a while to converge unless you get fancy.  Here we get fancy by using Parallel Tempering. 
+Include priors on structural parameters $X_{ij0},\Theta, p_a, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}$, then sample from the joint posterior of all structural parameters and the states (nuissance parameters).  Discard the samples from the nuissance parameters to marginalize / integrate them out leaving a sample from $P(X_{ij0},\Theta, \alpha, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i} \mid DTP_{ij1},...,DTP_{ijt})$.   The sampler may be inefficient and take a while to converge unless you get fancy.  Typically people use Sequential Monte Carlo, but I'm using a faster to code, slower to run Parallel Tempering sampler.  
 
 
 
@@ -96,7 +92,7 @@ Include priors on structural parameters $X_{ij0},\Theta, p_a, \sigma^2_{\epsilon
 
 ## Priors
 
-The coefficients $\theta=[a,b,c]$, process evolution noise $\sigma_{\delta}^2$ observational error, $\sigma^2_{e}$, the initial unobserved process $X_{j0}$, and the probability of observation $p_a$, all need priors, of which we use these models:
+The coefficients $\theta=[a,b,c]$, process evolution noise $\sigma_{\delta}^2$ observational error, $\sigma^2_{e}$, initial unobserved process $X_{j0}$, and the probability of observation $p_a$, all need priors, of which we use these models:
 
 
 $$a,b,c\overset{iid}{\sim }N(0,1)$$
@@ -125,7 +121,7 @@ datafile   = paste0(datafolder,"nmf-time-series-g20.csv")
 
 #2. topic of interest
 candidate_topics = c("inflat" ,"brexit", "covid", "cbdc", "ukrain" )
-(topic_of_interest = candidate_topics[3])
+(topic_of_interest = candidate_topics[4])
 
 #3 countries to use.  
 # possible option
@@ -135,20 +131,25 @@ CUSA = c ("Canada","United States")
 # actual decision:
 countries2use = G7_countries# unique(dataset$country)
 
-#4 first month to use
+#4 first month to use, 
+# start of dataset
 start_date = ymd("2008-11-01")
+# otherwise the month before the first mention in the dataset.
 if(topic_of_interest=="brexit"){
   start_date = ymd("2016-02-01")
 }
 if(topic_of_interest=="covid"){
   start_date = ymd("2020-01-01")
 }
+if(topic_of_interest=="cbdc"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="ukrain"){
+  start_date = ymd("2014-03-01")
+}
 
-
-#5 decision to log (or not log) the dataset.  Note that the data is transformed and the "prefix" is 
-# prefix = "log"   # since using log transformed data.
-prefix = "raw_super_slow_" # if not using log transformed data.
-# LOG STUFF IS NOT TESTED SINCE IT REQUIRES SOME ADJUSTMENTS TO PRIORS ON X
+#5  prefix for naming output filenames
+prefix = "raw" 
 
 ```
 
@@ -159,7 +160,7 @@ prefix = "raw_super_slow_" # if not using log transformed data.
 
 
 ```{r dataload}
-
+#| warning: false
 
 #. just loading and maybe transforming the data:
 data_full = dataload(datafile, topic_of_interest, countries2use, start_date)
@@ -192,19 +193,16 @@ Use Metropolis Hastings.  This will be slow to sample.  In future move to a Sequ
 ## MCMC 
 
 
-Since vanilla MCMC will be slow to converge when there are many parameters, it is generally better to use HMC by re-writing everything in STAN or by using parallel tempering and performing some heavy tuning.  The latter is the approach that this document takes.  The alternative is to run Sequential Monte Carlo, which generlaly performs well for State Space models
-Set up the MCMC details.
-
+Set up the iterations, transition variances and frequency of tuning thereof, temperatures for running the tempering.
 
 ```{r preamble}
 #| code-fold: true
 
-if(!exists("niter")){ niter = 5000 }    # total number of iterations
+if(!exists("niter")){ niter = 50000 }    # total number of iterations
 print(niter)
-if(!exists("nstops")){nstops = 50  }   # number of times to assess the acceptance rate 
+if(!exists("nstops")){nstops = 500  }   # number of times to assess the acceptance rate 
 print(nstops)
-Nparblocks = 7 #{pa,X,A,B,C,sigma2_delta,sigma2_e}
-step_var = .01      # starting transition variances for {pa,X,A,B,C,sigma2_delta,sigma2_e}
+step_var = .01      # starting transition variances for {pa,X,A,B,C,sigma2_delta,sigma2_e, Xother}
 temperatures = c(.25,.5,.75,.875,1) # 5 temperatures for the MCMC
 ```
 
@@ -218,7 +216,7 @@ Run the MCMC.
 #| eval: false
 
 
-filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
+filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),"_",niter,".Rdata")
 print(filename)
 
 P = 1 # max lag
@@ -256,9 +254,7 @@ save.image(filename)
 
 ## Make some plots:
 
-As always, discard the part of the MCMC where I was adapting the chains.
-
-
+In all cases discard the part of the MCMC where chains were being adapted.
 
 
 
@@ -269,7 +265,7 @@ As always, discard the part of the MCMC where I was adapting the chains.
 
 topic_of_interest = candidate_topics[1]
 filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
-
+# filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),"_",niter,".Rdata")
 ```
 
 ## Topic `r topic_of_interest`
@@ -278,9 +274,9 @@ Results loop over the topics of interest and rely on having run the above code s
 
 ```{r top1load}
 #| code-fold: true
-print(filename)
-load(filename)
 
+load(filename)
+print(filename)
 ```
 
 
@@ -288,7 +284,7 @@ load(filename)
 #| code-fold: true
 #| output: asis
 
-
+niter = PT_results$theta[[1]]|> nrow()
 A_index        = PT_results$theta_labels |> grep(pattern = "^A")
 B_index        = PT_results$theta_labels |> grep(pattern = "^B")
 C_index        = PT_results$theta_labels |> grep(pattern = "^C")
@@ -301,25 +297,12 @@ X0_index       = PT_results$theta_labels |> grep(pattern = "^X0")
 Nsam = 1000
 
 NChain = length(temperatures)
-datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = ncol(PT_results$Xmat[[1]])/length(A_index))), ncol(data))
 logpost_samp = NA
 inds_keep = sample(floor(niter/2):niter, size = Nsam)
 
-
-## replace this given that we store samples of X so we should just use those as is.
-
-NChain = length(PT_results$temperatures)
-datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
-logpost_samp = NA
-inds_keep = NA
 for(sample_use in 1:Nsam){
-  index = sample(floor(niter/2):niter, size = 1)
-  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
-  inds_keep[sample_use] = index
-  prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
-                                  PT_results$theta_labels,
-                                  data, 
-                                  P = 1)$X_full
+  prop_model = matrix(PT_results$Xmat[[5]][inds_keep[sample_use],], ncol = length(countries2use))
   for(variable in 1:ncol(data)){
       datafull[[variable]][sample_use, ] = prop_model[,variable]
     }
@@ -331,7 +314,8 @@ matplot(x = dates_in_use,
   t(datafull[[country]]), 
         type = 'l',  
         main = paste("posterior predictive fit for country",
-                                                          colnames(data)[country]))
+                                                          colnames(data)[country]),
+  ylim = c(-.1,.5))
 points(x = dates_in_use,
        data[,country], 
        pch = "*", cex = 3, col= "red")
@@ -378,8 +362,9 @@ print("sigma2_e")
 PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
 
 
-LP = data.frame(sigma2_delta = PT_results$theta[[1]][,"sigma2_delta"],
-                sigma2_e = PT_results$theta[[1]][,"sigma2_e"],
+LP = data.frame(
+        sigma2_delta = PT_results$theta[[5]][,"sigma2_delta"],
+        sigma2_e = PT_results$theta[[5]][,"sigma2_e"],
         index = rep(1:niter,  length(temperatures)))|> 
   filter(index>floor(niter/2)) |>
   pivot_longer(cols = starts_with("sigma2"), names_to = "sigma2", values_to = "value")
@@ -414,27 +399,33 @@ for(chain in 1:length(temperatures)){
                 mutate(temp = as.factor(temperatures[chain])))
 }
 stacked |> 
-  filter(index>floor(niter/5))|>
+  filter(index>floor(niter/2))|>
   filter(str_detect(par, pattern = "^A" ))|>
+  filter(temp == "1")|>
   ggplot()+
-  geom_density(aes(x = val, group = temp, colour = temp ))+
+  geom_density(aes(x = val ))+
+  geom_vline(xintercept = 0, linewidth = .5)+
   facet_wrap(~par) + ggtitle("thetas, A")
 
 
 stacked |> 
-    filter(index>floor(niter/5))|>
+    filter(index>floor(niter/2))|>
     filter(str_detect(par, pattern = "^B" ))|>
+  filter(temp == "1")|>
     ggplot()+
-    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_density(aes(x = val ))+
+    geom_vline(xintercept = 0, linewidth = .5)+
     facet_wrap(~par) + ggtitle("thetas, B")
 
 
 stacked |> 
-    filter(index>floor(niter/5))|>
+    filter(index>floor(niter/2))|>
     filter(str_detect(par, pattern = "^C" ))|>
+  filter(temp == "1")|>
     ggplot()+
-    geom_density(aes(x = val, group = temp, colour = temp ))+
-    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+    geom_density(aes(x = val))+
+    geom_vline(xintercept = 0)+ 
+  facet_wrap(~par) + ggtitle("thetas, C")
 
 
 
@@ -447,7 +438,7 @@ stacked |>
 
 topic_of_interest = candidate_topics[2]
 filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
-
+# filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),"_",niter,".Rdata")
 ```
 
 ## Topic `r topic_of_interest`
@@ -466,7 +457,7 @@ load(filename)
 #| code-fold: true
 #| output: asis
 
-
+niter = PT_results$theta[[1]]|> nrow()
 A_index        = PT_results$theta_labels |> grep(pattern = "^A")
 B_index        = PT_results$theta_labels |> grep(pattern = "^B")
 C_index        = PT_results$theta_labels |> grep(pattern = "^C")
@@ -479,22 +470,12 @@ X0_index       = PT_results$theta_labels |> grep(pattern = "^X0")
 Nsam = 1000
 
 NChain = length(temperatures)
-datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = ncol(PT_results$Xmat[[1]])/length(A_index))), ncol(data))
 logpost_samp = NA
 inds_keep = sample(floor(niter/2):niter, size = Nsam)
 
-NChain = length(PT_results$temperatures)
-datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
-logpost_samp = NA
-inds_keep = NA
 for(sample_use in 1:Nsam){
-  index = sample(floor(niter/2):niter, size = 1)
-  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
-  inds_keep[sample_use] = index
-  prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
-                                  PT_results$theta_labels,
-                                  data, 
-                                  P = 1)$X_full
+  prop_model = matrix(PT_results$Xmat[[5]][inds_keep[sample_use],], ncol = length(countries2use))
   for(variable in 1:ncol(data)){
       datafull[[variable]][sample_use, ] = prop_model[,variable]
     }
@@ -506,7 +487,8 @@ matplot(x = dates_in_use,
   t(datafull[[country]]), 
         type = 'l',  
         main = paste("posterior predictive fit for country",
-                                                          colnames(data)[country]))
+                                                          colnames(data)[country]),
+  ylim = c(-.1,.5))
 points(x = dates_in_use,
        data[,country], 
        pch = "*", cex = 3, col= "red")
@@ -520,7 +502,7 @@ If a topic is non-stationary over this time duration then time series will aim f
 
 
 
-```{r top2samp}
+```{r top2logpost}
 #| code-fold: true
 #| output: asis
 
@@ -541,7 +523,7 @@ LP|>
 
 
 
-```{r top2sig}
+```{r}
 #| code-fold: true
 #| output: asis
 
@@ -553,8 +535,9 @@ print("sigma2_e")
 PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
 
 
-LP = data.frame(sigma2_delta = PT_results$theta[[1]][,"sigma2_delta"],
-                sigma2_e = PT_results$theta[[1]][,"sigma2_e"],
+LP = data.frame(
+        sigma2_delta = PT_results$theta[[5]][,"sigma2_delta"],
+        sigma2_e = PT_results$theta[[5]][,"sigma2_e"],
         index = rep(1:niter,  length(temperatures)))|> 
   filter(index>floor(niter/2)) |>
   pivot_longer(cols = starts_with("sigma2"), names_to = "sigma2", values_to = "value")
@@ -589,27 +572,33 @@ for(chain in 1:length(temperatures)){
                 mutate(temp = as.factor(temperatures[chain])))
 }
 stacked |> 
-  filter(index>floor(niter/5))|>
+  filter(index>floor(niter/2))|>
   filter(str_detect(par, pattern = "^A" ))|>
+  filter(temp == "1")|>
   ggplot()+
-  geom_density(aes(x = val, group = temp, colour = temp ))+
+  geom_density(aes(x = val ))+
+  geom_vline(xintercept = 0, linewidth = .5)+
   facet_wrap(~par) + ggtitle("thetas, A")
 
 
 stacked |> 
-    filter(index>floor(niter/5))|>
+    filter(index>floor(niter/2))|>
     filter(str_detect(par, pattern = "^B" ))|>
+  filter(temp == "1")|>
     ggplot()+
-    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_density(aes(x = val ))+
+    geom_vline(xintercept = 0, linewidth = .5)+
     facet_wrap(~par) + ggtitle("thetas, B")
 
 
 stacked |> 
-    filter(index>floor(niter/5))|>
+    filter(index>floor(niter/2))|>
     filter(str_detect(par, pattern = "^C" ))|>
+  filter(temp == "1")|>
     ggplot()+
-    geom_density(aes(x = val, group = temp, colour = temp ))+
-    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+    geom_density(aes(x = val))+
+    geom_vline(xintercept = 0)+ 
+  facet_wrap(~par) + ggtitle("thetas, C")
 
 
 
@@ -626,7 +615,7 @@ stacked |>
 
 topic_of_interest = candidate_topics[3]
 filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
-
+# filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),"_",niter,".Rdata")
 ```
 
 ## Topic `r topic_of_interest`
@@ -645,7 +634,7 @@ load(filename)
 #| code-fold: true
 #| output: asis
 
-
+niter = PT_results$theta[[1]]|> nrow()
 A_index        = PT_results$theta_labels |> grep(pattern = "^A")
 B_index        = PT_results$theta_labels |> grep(pattern = "^B")
 C_index        = PT_results$theta_labels |> grep(pattern = "^C")
@@ -658,22 +647,12 @@ X0_index       = PT_results$theta_labels |> grep(pattern = "^X0")
 Nsam = 1000
 
 NChain = length(temperatures)
-datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = ncol(PT_results$Xmat[[1]])/length(A_index))), ncol(data))
 logpost_samp = NA
 inds_keep = sample(floor(niter/2):niter, size = Nsam)
 
-NChain = length(PT_results$temperatures)
-datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
-logpost_samp = NA
-inds_keep = NA
 for(sample_use in 1:Nsam){
-  index = sample(floor(niter/2):niter, size = 1)
-  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
-  inds_keep[sample_use] = index
-  prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
-                                  PT_results$theta_labels,
-                                  data, 
-                                  P = 1)$X_full
+  prop_model = matrix(PT_results$Xmat[[5]][inds_keep[sample_use],], ncol = length(countries2use))
   for(variable in 1:ncol(data)){
       datafull[[variable]][sample_use, ] = prop_model[,variable]
     }
@@ -685,7 +664,8 @@ matplot(x = dates_in_use,
   t(datafull[[country]]), 
         type = 'l',  
         main = paste("posterior predictive fit for country",
-                                                          colnames(data)[country]))
+                                                          colnames(data)[country]),
+  ylim = c(-.1,.5))
 points(x = dates_in_use,
        data[,country], 
        pch = "*", cex = 3, col= "red")
@@ -699,7 +679,7 @@ If a topic is non-stationary over this time duration then time series will aim f
 
 
 
-```{r top3sampl}
+```{r top3logpost}
 #| code-fold: true
 #| output: asis
 
@@ -732,8 +712,9 @@ print("sigma2_e")
 PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
 
 
-LP = data.frame(sigma2_delta = PT_results$theta[[1]][,"sigma2_delta"],
-                sigma2_e = PT_results$theta[[1]][,"sigma2_e"],
+LP = data.frame(
+        sigma2_delta = PT_results$theta[[5]][,"sigma2_delta"],
+        sigma2_e = PT_results$theta[[5]][,"sigma2_e"],
         index = rep(1:niter,  length(temperatures)))|> 
   filter(index>floor(niter/2)) |>
   pivot_longer(cols = starts_with("sigma2"), names_to = "sigma2", values_to = "value")
@@ -768,27 +749,33 @@ for(chain in 1:length(temperatures)){
                 mutate(temp = as.factor(temperatures[chain])))
 }
 stacked |> 
-  filter(index>floor(niter/5))|>
+  filter(index>floor(niter/2))|>
   filter(str_detect(par, pattern = "^A" ))|>
+  filter(temp == "1")|>
   ggplot()+
-  geom_density(aes(x = val, group = temp, colour = temp ))+
+  geom_density(aes(x = val ))+
+  geom_vline(xintercept = 0, linewidth = .5)+
   facet_wrap(~par) + ggtitle("thetas, A")
 
 
 stacked |> 
-    filter(index>floor(niter/5))|>
+    filter(index>floor(niter/2))|>
     filter(str_detect(par, pattern = "^B" ))|>
+  filter(temp == "1")|>
     ggplot()+
-    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_density(aes(x = val ))+
+    geom_vline(xintercept = 0, linewidth = .5)+
     facet_wrap(~par) + ggtitle("thetas, B")
 
 
 stacked |> 
-    filter(index>floor(niter/5))|>
+    filter(index>floor(niter/2))|>
     filter(str_detect(par, pattern = "^C" ))|>
+  filter(temp == "1")|>
     ggplot()+
-    geom_density(aes(x = val, group = temp, colour = temp ))+
-    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+    geom_density(aes(x = val))+
+    geom_vline(xintercept = 0)+ 
+  facet_wrap(~par) + ggtitle("thetas, C")
 
 
 
@@ -811,7 +798,7 @@ stacked |>
 
 topic_of_interest = candidate_topics[4]
 filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
-
+# filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),"_",niter,".Rdata")
 ```
 
 ## Topic `r topic_of_interest`
@@ -830,7 +817,7 @@ load(filename)
 #| code-fold: true
 #| output: asis
 
-
+niter = PT_results$theta[[1]]|> nrow()
 A_index        = PT_results$theta_labels |> grep(pattern = "^A")
 B_index        = PT_results$theta_labels |> grep(pattern = "^B")
 C_index        = PT_results$theta_labels |> grep(pattern = "^C")
@@ -843,22 +830,12 @@ X0_index       = PT_results$theta_labels |> grep(pattern = "^X0")
 Nsam = 1000
 
 NChain = length(temperatures)
-datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = ncol(PT_results$Xmat[[1]])/length(A_index))), ncol(data))
 logpost_samp = NA
 inds_keep = sample(floor(niter/2):niter, size = Nsam)
 
-NChain = length(PT_results$temperatures)
-datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
-logpost_samp = NA
-inds_keep = NA
 for(sample_use in 1:Nsam){
-  index = sample(floor(niter/2):niter, size = 1)
-  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
-  inds_keep[sample_use] = index
-  prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
-                                  PT_results$theta_labels,
-                                  data, 
-                                  P = 1)$X_full
+  prop_model = matrix(PT_results$Xmat[[5]][inds_keep[sample_use],], ncol = length(countries2use))
   for(variable in 1:ncol(data)){
       datafull[[variable]][sample_use, ] = prop_model[,variable]
     }
@@ -870,7 +847,8 @@ matplot(x = dates_in_use,
   t(datafull[[country]]), 
         type = 'l',  
         main = paste("posterior predictive fit for country",
-                                                          colnames(data)[country]))
+                                                          colnames(data)[country]),
+  ylim = c(-.1,.5))
 points(x = dates_in_use,
        data[,country], 
        pch = "*", cex = 3, col= "red")
@@ -884,7 +862,7 @@ If a topic is non-stationary over this time duration then time series will aim f
 
 
 
-```{r top4samp}
+```{r top4logpost}
 #| code-fold: true
 #| output: asis
 
@@ -917,8 +895,9 @@ print("sigma2_e")
 PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
 
 
-LP = data.frame(sigma2_delta = PT_results$theta[[1]][,"sigma2_delta"],
-                sigma2_e = PT_results$theta[[1]][,"sigma2_e"],
+LP = data.frame(
+        sigma2_delta = PT_results$theta[[5]][,"sigma2_delta"],
+        sigma2_e = PT_results$theta[[5]][,"sigma2_e"],
         index = rep(1:niter,  length(temperatures)))|> 
   filter(index>floor(niter/2)) |>
   pivot_longer(cols = starts_with("sigma2"), names_to = "sigma2", values_to = "value")
@@ -953,27 +932,33 @@ for(chain in 1:length(temperatures)){
                 mutate(temp = as.factor(temperatures[chain])))
 }
 stacked |> 
-  filter(index>floor(niter/5))|>
+  filter(index>floor(niter/2))|>
   filter(str_detect(par, pattern = "^A" ))|>
+  filter(temp == "1")|>
   ggplot()+
-  geom_density(aes(x = val, group = temp, colour = temp ))+
+  geom_density(aes(x = val ))+
+  geom_vline(xintercept = 0, linewidth = .5)+
   facet_wrap(~par) + ggtitle("thetas, A")
 
 
 stacked |> 
-    filter(index>floor(niter/5))|>
+    filter(index>floor(niter/2))|>
     filter(str_detect(par, pattern = "^B" ))|>
+  filter(temp == "1")|>
     ggplot()+
-    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_density(aes(x = val ))+
+    geom_vline(xintercept = 0, linewidth = .5)+
     facet_wrap(~par) + ggtitle("thetas, B")
 
 
 stacked |> 
-    filter(index>floor(niter/5))|>
+    filter(index>floor(niter/2))|>
     filter(str_detect(par, pattern = "^C" ))|>
+  filter(temp == "1")|>
     ggplot()+
-    geom_density(aes(x = val, group = temp, colour = temp ))+
-    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+    geom_density(aes(x = val))+
+    geom_vline(xintercept = 0)+ 
+  facet_wrap(~par) + ggtitle("thetas, C")
 
 
 
@@ -1001,7 +986,7 @@ stacked |>
 
 topic_of_interest = candidate_topics[5]
 filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
-
+# filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),"_",niter,".Rdata")
 ```
 
 ## Topic `r topic_of_interest`
@@ -1020,7 +1005,7 @@ load(filename)
 #| code-fold: true
 #| output: asis
 
-
+niter = PT_results$theta[[1]]|> nrow()
 A_index        = PT_results$theta_labels |> grep(pattern = "^A")
 B_index        = PT_results$theta_labels |> grep(pattern = "^B")
 C_index        = PT_results$theta_labels |> grep(pattern = "^C")
@@ -1033,22 +1018,12 @@ X0_index       = PT_results$theta_labels |> grep(pattern = "^X0")
 Nsam = 1000
 
 NChain = length(temperatures)
-datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
+datafull = rep(list(matrix(NA, nrow = Nsam, ncol = ncol(PT_results$Xmat[[1]])/length(A_index))), ncol(data))
 logpost_samp = NA
 inds_keep = sample(floor(niter/2):niter, size = Nsam)
 
-NChain = length(PT_results$temperatures)
-datafull = rep(list(matrix(NA, nrow = Nsam, ncol = nrow(data))), ncol(data))
-logpost_samp = NA
-inds_keep = NA
 for(sample_use in 1:Nsam){
-  index = sample(floor(niter/2):niter, size = 1)
-  logpost_samp[sample_use] = PT_results$log_posterior[[NChain]][index]
-  inds_keep[sample_use] = index
-  prop_model = model_predict_SS(theta = PT_results$theta[[NChain]][index,],
-                                  PT_results$theta_labels,
-                                  data, 
-                                  P = 1)$X_full
+  prop_model = matrix(PT_results$Xmat[[5]][inds_keep[sample_use],], ncol = length(countries2use))
   for(variable in 1:ncol(data)){
       datafull[[variable]][sample_use, ] = prop_model[,variable]
     }
@@ -1060,7 +1035,8 @@ matplot(x = dates_in_use,
   t(datafull[[country]]), 
         type = 'l',  
         main = paste("posterior predictive fit for country",
-                                                          colnames(data)[country]))
+                                                          colnames(data)[country]),
+  ylim = c(-.1,.5))
 points(x = dates_in_use,
        data[,country], 
        pch = "*", cex = 3, col= "red")
@@ -1074,7 +1050,7 @@ If a topic is non-stationary over this time duration then time series will aim f
 
 
 
-```{r}
+```{r top5logpost}
 #| code-fold: true
 #| output: asis
 
@@ -1095,7 +1071,7 @@ LP|>
 
 
 
-```{r top5sig}
+```{r}
 #| code-fold: true
 #| output: asis
 
@@ -1107,8 +1083,9 @@ print("sigma2_e")
 PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
 
 
-LP = data.frame(sigma2_delta = PT_results$theta[[1]][,"sigma2_delta"],
-                sigma2_e = PT_results$theta[[1]][,"sigma2_e"],
+LP = data.frame(
+        sigma2_delta = PT_results$theta[[5]][,"sigma2_delta"],
+        sigma2_e = PT_results$theta[[5]][,"sigma2_e"],
         index = rep(1:niter,  length(temperatures)))|> 
   filter(index>floor(niter/2)) |>
   pivot_longer(cols = starts_with("sigma2"), names_to = "sigma2", values_to = "value")
@@ -1143,27 +1120,33 @@ for(chain in 1:length(temperatures)){
                 mutate(temp = as.factor(temperatures[chain])))
 }
 stacked |> 
-  filter(index>floor(niter/5))|>
+  filter(index>floor(niter/2))|>
   filter(str_detect(par, pattern = "^A" ))|>
+  filter(temp == "1")|>
   ggplot()+
-  geom_density(aes(x = val, group = temp, colour = temp ))+
+  geom_density(aes(x = val ))+
+  geom_vline(xintercept = 0, linewidth = .5)+
   facet_wrap(~par) + ggtitle("thetas, A")
 
 
 stacked |> 
-    filter(index>floor(niter/5))|>
+    filter(index>floor(niter/2))|>
     filter(str_detect(par, pattern = "^B" ))|>
+  filter(temp == "1")|>
     ggplot()+
-    geom_density(aes(x = val, group = temp, colour = temp ))+
+    geom_density(aes(x = val ))+
+    geom_vline(xintercept = 0, linewidth = .5)+
     facet_wrap(~par) + ggtitle("thetas, B")
 
 
 stacked |> 
-    filter(index>floor(niter/5))|>
+    filter(index>floor(niter/2))|>
     filter(str_detect(par, pattern = "^C" ))|>
+  filter(temp == "1")|>
     ggplot()+
-    geom_density(aes(x = val, group = temp, colour = temp ))+
-    geom_vline(xintercept = 0)+ facet_wrap(~par) + ggtitle("thetas, C")
+    geom_density(aes(x = val))+
+    geom_vline(xintercept = 0)+ 
+  facet_wrap(~par) + ggtitle("thetas, C")
 
 
 
