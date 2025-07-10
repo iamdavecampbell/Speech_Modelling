@@ -23,4 +23,5 @@ Dropping the reliance on the topic index _i_, the model transitions ahead based 
 
 $$X_{jt} = a_j+b_{j} * X_{jt-1} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * X_{kt-1}+ \delta_{jt}.$$
 
-
+- MCMC_SS_functions.R = functions for performing MCMC on a state space model.  
+- Data_PTModelling_state_space.qmd = runs MCMC on data
