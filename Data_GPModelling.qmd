@@ -2,22 +2,20 @@
 title: "Gaussian Process Model"
 format: 
   html:
+    embed-resources: true
     html-math-method: 
       method: mathjax
       url: https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.2/MathJax.js?config=TeX-AMS-MML_HTMLorMML
     echo: true
     warning: false
+    cache: true
 ---
 
-## Overview of Gaussian Process Models
+## Assessment
 
-When fitting a regression function to data, multiple different functions could fit the data equally well. Gaussian Processes (GPs) take advantage of this concept by setting a prior distribution for the regression function. This prior distribution utilizes a Gaussian process, where any finite-dimensional marginal distribution is Gaussian.
+State space models appear promising, however depending on the task at hand, can require high computational resources. Gaussian Processes (GPs) provide similar end results with significantly less resources required. Note, these results are preliminary as they only contain a single country per model, and the hyperparameters are still being tuned.
 
-The GP prior here for regression function $\mu(x)$ is $\mu \sim \text{GP}(m, k)$, where $m$ is a mean function and $k$ is a covariance function. This allows $\mu$ to be defined as a random function, further allowing for predictions at pre-specified locations to be a draw from a multivariate normal distribution.
-
-The mean function, $m$, can be thought of as an inital linear regression model ($m(x) = X\beta$) and the covariance function, $k$, defines the correlation between any two points. In GPs, using a squared exponential kernel for the covariance function is common. More details regarding kernels are available in the section "Creating the Model".
-
-In this implementation, we are modelling one country for one topic, so $x$ represents time and $\mu(x)$ aims to model the DTP for that country-topic pair.
+## Basics
 
 
 ```{r version}
@@ -28,11 +26,48 @@ library(lubridate)
 library(truncnorm)
 library(mvtnorm)
 library(matlib)
+library(rstan)
+
 # import functions for data loading
 source("MCMC_functions.R")
 ```
+## Gaussian Process Model:
+
+When fitting a regression function to data, multiple different functions could fit the data equally well. Gaussian Process (GP) regression takes advantage of this concept by setting a prior distribution, where any finite-dimensional marginal distribution is Gaussian, for an unknown regression function.
+
+Due to the GP prior on the regression function, the function can be defined as a stochastic process where $n$ pre-specified points are drawn from an $n$-dimensional normal distribution. This naturally handles any periods where a Bank does not mention a given topic, as these points do not need to be evenly spaced.
+
+#### Observation process:
+
+$$\mu(x_1), \dots, \mu(x_n) \sim \mathcal{N}((m(x_1), \dots, m(x_n)), K(x_1, \dots, x_n))$$
+
+where $\mu(x_t)$ is the DTP for a specified country at time $t$, $t = 1, \dots, n$, $m$ is the mean function, and $K$ is the matrix of covariance functions. 
+
+The mean function, $m$, can be thought of as an initial linear regression model ($m(x) = X\beta$) and the covariance function, $k$, defines the correlation between any two points. In GPs, using a squared exponential kernel for the covariance function is a common first step.
+
+#### Kernel
 
 
+The squared exponential kernel is defined as follows:
+
+$$ k(x, x') = \alpha^2 \exp(-\frac{|x - x'|^2}{2\rho^2})$$
+Note, $\alpha$ and $\rho$ are both hyperparameters which control the shape of the kernel, with $\alpha$ controlling magnitude and $\rho$ the smoothness. More details regarding their optimization are in the section below.
+
+#### Log marginal likelihood
+
+$$
+\log p(y|\alpha, \rho, \sigma^2) = -\frac{n}{2}\log(2\pi) - \frac{1}{2}\log|K(x, x) + \sigma^2I| - \frac{1}{2}y^T(K(x, x) + \sigma^2I)^{-1}y
+$$
+
+Note, maximizing this log likelihood will provide the optimal values for $\alpha$, $\rho$, and residual variance $\sigma^2$.
+
+## Priors
+
+Outside of the GP prior assumption itself ($\mu \sim GP(m, k)$), the hyperparameters for the kernel ($\alpha$ and $\rho$), and residual variance $sigma^2$ all require priors themselves.
+
+$$\alpha \sim \mathcal{N}(0, 1)$$
+$$\rho \sim \text{Inv-Gamma}(5, 5) $$
+$$\sigma \sim \mathcal{N}(0, 1)$$
 
 ## User Defined Options
 
@@ -50,7 +85,7 @@ Note that there are some switches that a user may define here.  In this code blo
 datafile = "nmf-time-series-g20.csv"
 #2. topic of interest
 candidate_topics = c("inflat" ,"brexit", "covid", "cbdc", "ukrain" )
-(topic_of_interest = candidate_topics[3])
+topic_of_interest = candidate_topics[3]
 
 #3 countries to use.  
 # possible option
@@ -81,6 +116,8 @@ if(topic_of_interest=="ukrain"){
 
 
 ```{r dataload}
+#| warning: false
+#| message: false
 # loading data
 data_full = dataload(datafile, topic_of_interest, countries2use, start_date)
 dates_in_use = data_full$dates_in_use
@@ -89,17 +126,10 @@ data = data_full$data
 
 ## Creating the model
 
-### Setting the kernel, k
-
-This kernel is defined as follows:
-
-$$ k(x, x') = \tau^2 \exp(-\frac{|x - x'|^2}{2l^2})$$
-Note, $\tau$ and $l$ are both hyperparameters which control the shape of the kernel, with $\tau$ controlling magnitude and $l$ the smoothness. More details regarding their optimization are at the bottom of this section.
-
 ```{r kernel_setting}
 # kernel function
-sq_exp_kernel <- function(x_left, x_right, tau, l){
-  
+sq_exp_kernel <- function(x_left, x_right, alpha, rho){
+
   # creating matrix template
   n <- length(x_left)
   m <- length(x_right)
@@ -111,24 +141,37 @@ sq_exp_kernel <- function(x_left, x_right, tau, l){
       x_right <- c(x_right, rep(0, n-m))
     }
   }
-  
+
   # calculate euclid distances
-  euclid_dist <- dist(data.frame(x_left, x_right), 
-                      method = "euclidean", 
-                      diag = TRUE, 
-                      upper = TRUE) |> 
+  euclid_dist <- dist(data.frame(x_left, x_right),
+                      method = "euclidean",
+                      diag = TRUE,
+                      upper = TRUE) |>
                  as.matrix()
-  
+
   # calculate squared exponential
   for(i in 1:n){
     for(j in 1:m){
-      expon <- ((euclid_dist[i,j])^2)/(2*(l^2))
-      cov_mat[i,j] <- tau^2 * exp(-expon)
+      expon <- ((euclid_dist[i,j])^2)/(2*(rho^2))
+      cov_mat[i,j] <- alpha^2 * exp(-expon)
     }
   }
   return(cov_mat)
 }
 ```
+
+## Sampling Scheme
+
+This implementation utilizes the language Stan for efficient sampling, currently with the no-u-turns (NUTS) algorithm.
+
+1. calculate $K$ using the kernel function and current values of $\alpha$ and $\rho$
+2. calculate the Cholesky decomposition of $K$ from step 1, denoted $L_K$
+3. sample $\rho$
+4. sample $\alpha$
+5. sample $\sigma$
+6. sample $\mu$ from a multivariate normal distribution with Cholesky parameterization using mean function $m$ and covariance $L_K$ from step 2
+
+Note, the mean function is currently set to a 0 vector, and Cholesky decomposition was used for computational efficiency.
 
 ### Conducting Inference
 
@@ -158,67 +201,140 @@ where $\sigma^2$ is the covariance for $y$.
 Utilizing this relationship, the posterior for $\tilde{\mu}$ at a new location $\tilde{x}$ is:
 
 $$
-\tilde{\mu}| x, y, \tau, l, \sigma \sim \mathcal{N}(E(\tilde{\mu}), cov(\tilde{\mu}))\\
+\tilde{\mu}| x, y, \alpha, l, \sigma \sim \mathcal{N}(E(\tilde{\mu}), cov(\tilde{\mu}))\\
 E(\tilde{\mu}) = K(\tilde{x}, x)(K(x, x)+\sigma^2I)^{-1}y\\
 cov(\tilde{\mu}) = K(\tilde{x}, \tilde{x}) - K(\tilde{x}, x)(K(x, x) + \sigma^2I)^{-1}K(x, \tilde{x})
 $$
-For the hyperparameters $\sigma$, $\tau$, and $l$, they can all be optimized by using the marginal likelihood:
 
-$$
-\log p(y|\tau, l, \sigma^2) = -\frac{n}{2}\log(2\pi) - \frac{1}{2}\log|K(x, x) + \sigma^2I| - \frac{1}{2}y^T(K(x, x) + \sigma^2I)^{-1}y
-$$
+<!-- ### Stan implementation -->
 
-Note, this optimization has not yet been implemented. 
+<!-- Note, the code below is referred to later as `gp_exp_kernel.stan`. Including the results from this method into the GP fitting is currently ongoing. -->
 
-```{r}
-# fitting GP
-fit_GP <- function(x, y, nsim, sigma, tau, l, x_pred = NULL){
-  
+<!-- ```{stan output.var = "gp_exp_kernel.stan"} -->
+<!-- #| eval: false -->
+
+<!-- data { -->
+<!--   int<lower=1> N; -->
+<!--   array[N] real x; -->
+<!--   vector[N] y; -->
+<!-- } -->
+<!-- transformed data { -->
+<!--   vector[N] mu = rep_vector(0, N); -->
+<!-- } -->
+<!-- parameters { -->
+<!--   real<lower=0> rho; -->
+<!--   real<lower=0> alpha; -->
+<!--   real<lower=0> sigma; -->
+<!-- } -->
+<!-- model { -->
+<!--   matrix[N, N] L_K; -->
+<!--   matrix[N, N] K = gp_exp_quad_cov(x, alpha, rho); -->
+<!--   real sq_sigma = square(sigma); -->
+
+<!--   // diagonal elements -->
+<!--   for (n in 1:N) { -->
+<!--     K[n, n] = K[n, n] + sq_sigma; -->
+<!--   } -->
+
+<!--   L_K = cholesky_decompose(K); -->
+
+<!--   rho ~ inv_gamma(5, 5); -->
+<!--   alpha ~ std_normal(); -->
+<!--   sigma ~ std_normal(); -->
+
+<!--   y ~ multi_normal_cholesky(mu, L_K); -->
+<!-- } -->
+
+<!-- ``` -->
+
+### Fitting the GP
+
+<!-- ```{r} -->
+<!-- #| eval: false -->
+
+<!-- # cycle through all combinations of topic and single country -->
+<!-- # for Stan optimization and save results -->
+<!-- for (topic in 1:length(candidate_topics)){ -->
+<!--   for (country in 1:length(G7_countries)){ -->
+
+<!--     # set topic and country -->
+<!--     topic_of_interest = candidate_topics[topic] -->
+<!--     countries2use = G7_countries[country] -->
+<!--     start_date = det_start_year(topic_of_interest) -->
+
+<!--     # loading data -->
+<!--     data_full = dataload(datafile, topic_of_interest, countries2use, start_date) -->
+<!--     dates_in_use = data_full$dates_in_use -->
+<!--     data = data_full$data -->
+
+<!--     data <- data.frame("x" = data_full$dates_in_use |> as.numeric(),  -->
+<!--                        data_full$data)  -->
+<!--     colnames(data)[2] <- "y" -->
+<!--     data <- data |> filter(!is.na(y)) -->
+
+<!--     sim_input <- list(N = length(data$x), -->
+<!--                       x = data$x, -->
+<!--                       y = data$y) -->
+
+
+<!--     fit <- stan(file = 'gp_exp_kernel.stan', data = sim_input, chains = 4, cores = 4,  -->
+<!--                 iter = 50000) -->
+
+<!--     save(fit, file = paste0("gp_stan_fit_", countries2use, "_", topic_of_interest, ".RData")) -->
+<!--   } -->
+<!-- } -->
+
+<!-- ``` -->
+
+
+```{r fitGP}
+fit_GP <- function(x, y, nsim = 10000, sigma, alpha, rho, x_pred = NULL){
+
   # setting x_pred values
   if (is.null(x_pred)){
     start_end <- range(x)
-    x_pred <- seq(from = start_end[1], 
-                  to = start_end[2], 
+    x_pred <- seq(from = start_end[1],
+                  to = start_end[2],
                   length.out = length(x))
   }
-  
+
   # setting covariance matrices
-  K_x <- sq_exp_kernel(x, x, tau, l)
-  K_x_pred <- sq_exp_kernel(x, x_pred, tau, l)
-  K_pred_x <- sq_exp_kernel(x_pred, x, tau, l)
-  K_pred <- sq_exp_kernel(x_pred, x_pred, tau, l)
-  
+  K_x <- sq_exp_kernel(x, x, alpha, rho)
+  K_x_pred <- sq_exp_kernel(x, x_pred, alpha, rho)
+  K_pred_x <- sq_exp_kernel(x_pred, x, alpha, rho)
+  K_pred <- sq_exp_kernel(x_pred, x_pred, alpha, rho)
+
   # calculating prediction mean
-  mean_pred <- K_pred_x %*% inv(K_x + diag(sigma, 
-                                           nrow = ncol(K_x), 
+  mean_pred <- K_pred_x %*% inv(K_x + diag(sigma,
+                                           nrow = ncol(K_x),
                                            ncol = ncol(K_x))) %*% y
-  
+
   # calculating prediction covariance
-  cov_pred = K_pred - K_pred_x %*% inv(K_x + diag(sigma, 
-                                                  nrow = ncol(K_x), 
+  cov_pred = K_pred - K_pred_x %*% inv(K_x + diag(sigma,
+                                                  nrow = ncol(K_x),
                                                   ncol = ncol(K_x))) %*% K_x_pred
-  
+
   # simulating gaussian distributions with prediction mean and covariance
   gen_y <- rmvnorm(nsim, mean_pred, cov_pred)
-  
-  
+
+
   # generating 95% conf bounds
   conf_1 <- mean_pred + qnorm(0.05, 0, sqrt(diag(cov_pred)))
   conf_2 <- mean_pred + qnorm(0.95, 0, sqrt(diag(cov_pred)))
-  conf_bounds <- data.frame(x_pred, mean_pred, conf_1, conf_2) |> 
+  conf_bounds <- data.frame(x_pred, mean_pred, conf_1, conf_2) |>
                   mutate(x_pred = as.Date(x_pred))
-  
+
   # reshaping generated values for easier plotting
   y_output <- gen_y |> t() |> cbind(x_pred)
   colnames(y_output)[-(nsim +1)] <- 1:nsim
-  y_output <- y_output |> as.data.frame() |> 
+  y_output <- y_output |> as.data.frame() |>
                           pivot_longer(!x_pred, names_to = "sim", values_to = "y") |>
                           mutate(x_pred = as.Date(x_pred))
-  
+
   output <- list()
   output[["conf_bounds"]] <- conf_bounds
   output[["y_output"]] <- y_output
-  
+
   return(output)
 }
 
@@ -226,169 +342,393 @@ fit_GP <- function(x, y, nsim, sigma, tau, l, x_pred = NULL){
 
 
 
-## Results
+## Make some plots
 
-Note, the current implementation does not consider hyperparameter ($\sigma$, $\tau$, $l$) fitting. Currently, the observation noise, $\sigma$, is set to 0.001, and the scaling of the kernels are set to 1.
+Note, the current implementation does not consider hyperparameter ($\sigma$, $\alpha$, $l$) fitting. Optimizing this values is in active development for this project. Currently, the observation noise, $\sigma$, is set to 0.0005, and the scaling of the kernels are set to 1.
 
-::: {.panel-tabset}
-### Canada, COVID
+::: panel-tabset
 
-```{r}
-#| code-fold: true
-
-(topic_of_interest = candidate_topics[3])
-countries2use = "Canada"
-start_date = ymd("2020-01-01")
-
-# loading data
-data_full = dataload(datafile, topic_of_interest, countries2use, start_date)
-dates_in_use = data_full$dates_in_use
-data = data_full$data
-```
-
-```{r}
-#| code-fold: true
-
-sigma <- 0.001
-tau <- 1
-l <- 1
-nsim <- 10000
-
-
-matplot(x = dates_in_use,y=data_full$data, type="l", 
-        main = topic_of_interest, 
-        ylab = "Topic Proportion",
-        xlab = "date")
-
-data <- data.frame("x" = data_full$dates_in_use |> as.numeric(), 
-                   data_full$data) 
-colnames(data)[2] <- "y"
-data <- data |> filter(!is.na(y))
-x <- data$x
-y <- data$y
-results_list <- fit_GP(x, y, nsim = nsim, sigma = sigma, tau = tau, l = l)
-y_output <- results_list[["y_output"]]
-conf_bounds <- results_list[["conf_bounds"]]
-```
-
-```{r}
-#| code-fold: true
-
-ggplot() +
-  geom_line(data = y_output, mapping = aes(x = x_pred, y = y, group = sim), colour= "grey") +
-  geom_line(data = conf_bounds, mapping = aes(x = x_pred, y = conf_1), colour = "red")+
-  geom_line(data = conf_bounds, mapping = aes(x = x_pred, y = conf_2), colour = "red")+
-  geom_point(data = data.frame("x" = as.Date(x), y), mapping = aes(x, y), colour = "black")+
-  geom_line(data = conf_bounds, mapping = aes(x = x_pred, y = mean_pred), colour = "black") +
-  theme_minimal() +
-  ggtitle(paste("Country:", countries2use, "Topic:", topic_of_interest), 
-          subtitle = paste("Sigma:", sigma, "tau:", tau, "L:", l)) +
-  ylab("DTP")+
-  xlab("Date")
-```
-### Canada, inflation 
-
-```{r}
-#| code-fold: true
-
-(topic_of_interest = candidate_topics[1])
-countries2use = "Canada"
+```{r top1start}
+#| echo: false
+topic_of_interest <- candidate_topics[1]
 start_date = ymd("2008-11-01")
-
-# loading data
-data_full = dataload(datafile, topic_of_interest, countries2use, start_date)
-dates_in_use = data_full$dates_in_use
-data = data_full$data
+# otherwise the month before the first mention in the dataset.
+if(topic_of_interest=="brexit"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="covid"){
+  start_date = ymd("2020-01-01")
+}
+if(topic_of_interest=="cbdc"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="ukrain"){
+  start_date = ymd("2014-03-01")
+}
 ```
 
-```{r}
+## Topic `r topic_of_interest`
+
+Results loop over the topics of interest and rely on having run the above code set across different topics.
+
+```{r top1fit}
 #| code-fold: true
+#| warning: false
+#| message: false
 
-sigma <- 0.001
-tau <- 1
-l <- 1
-nsim <- 10000
-
-
-matplot(x = dates_in_use,y=data_full$data, type="l", 
-        main = topic_of_interest, 
-        ylab = "Topic Proportion",
-        xlab = "date")
-
-data <- data.frame("x" = data_full$dates_in_use |> as.numeric(), 
+for (country in G7_countries){
+  # current placeholders, will load GP from Stan with optimal hyperparameters
+  rho <- 1
+  alpha <- 1
+  sigma <- 0.0005
+  
+  # load in observed data
+  data_full <-  dataload(datafile, topic_of_interest, country, start_date)
+  dates_in_use <-  data_full$dates_in_use
+  
+  # merge and remove NA values
+  data <- data.frame("x" = data_full$dates_in_use |> as.numeric(), 
                    data_full$data) 
-colnames(data)[2] <- "y"
-data <- data |> filter(!is.na(y))
-x <- data$x
-y <- data$y
-results_list <- fit_GP(x, y, nsim = nsim, sigma = sigma, tau = tau, l = l)
-y_output <- results_list[["y_output"]]
-conf_bounds <- results_list[["conf_bounds"]]
-
-ggplot() +
-  geom_line(data = y_output, mapping = aes(x = x_pred, y = y, group = sim), colour= "grey") +
-  geom_line(data = conf_bounds, mapping = aes(x = x_pred, y = conf_1), colour = "red")+
-  geom_line(data = conf_bounds, mapping = aes(x = x_pred, y = conf_2), colour = "red")+
-  geom_point(data = data.frame("x" = as.Date(x), y), mapping = aes(x, y), colour = "black")+
-  geom_line(data = conf_bounds, mapping = aes(x = x_pred, y = mean_pred), colour = "black") +
-  theme_minimal() +
-  ggtitle(paste("Country:", countries2use, "Topic:", topic_of_interest), 
-          subtitle = paste("Sigma:", sigma, "tau:", tau, "L:", l)) +
-  ylab("DTP")+
-  xlab("Date")
+  colnames(data)[2] <- "y"
+  data <- data |> filter(!is.na(y))
+  
+  # fit GP with optimal values
+  x <- data$x
+  y <- data$y
+  results_list <- fit_GP(x, y, sigma = sigma, alpha = alpha, rho = rho)
+  y_output <- results_list[["y_output"]]
+  conf_bounds <- results_list[["conf_bounds"]]
+  
+  plots <- ggplot() +
+    geom_line(data = y_output, 
+              mapping = aes(x = x_pred, y = y, group = sim), 
+              colour= "grey") +
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = conf_1), 
+              colour = "red")+
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = conf_2), 
+              colour = "red")+
+    geom_point(data = data.frame("x" = as.Date(x), y), 
+               mapping = aes(x, y), 
+               colour = "black")+
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = mean_pred), 
+              colour = "black") +
+    theme_minimal() +
+    ggtitle(paste("Country:", country, "Topic:", topic_of_interest), 
+            subtitle = paste("Sigma:", sigma, "Alpha:", alpha, "Rho:", rho)) +
+    ylab("DTP")+
+    xlab("Date")
+  print(plots)
+}
 
 ```
 
-### UK, Brexit
-
-```{r}
-#| code-fold: true
-
-(topic_of_interest = candidate_topics[2])
-countries2use = "United Kingdom"
-start_date = ymd("2016-02-01")
-
-# loading data
-data_full = dataload(datafile, topic_of_interest, countries2use, start_date)
-dates_in_use = data_full$dates_in_use
-data = data_full$data
+```{r top2start}
+#| echo: false
+topic_of_interest <- candidate_topics[2]
+start_date = ymd("2008-11-01")
+# otherwise the month before the first mention in the dataset.
+if(topic_of_interest=="brexit"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="covid"){
+  start_date = ymd("2020-01-01")
+}
+if(topic_of_interest=="cbdc"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="ukrain"){
+  start_date = ymd("2014-03-01")
+}
 ```
 
-```{r}
+## Topic `r topic_of_interest`
+
+Results loop over the topics of interest and rely on having run the above code set across different topics.
+
+```{r top2fit}
 #| code-fold: true
+#| warning: false
+#| message: false
 
-sigma <- 0.001
-tau <- 1
-l <- 1
-nsim <- 10000
-
-
-matplot(x = dates_in_use,y=data_full$data, type="l", 
-        main = topic_of_interest, 
-        ylab = "Topic Proportion",
-        xlab = "date")
-
-data <- data.frame("x" = data_full$dates_in_use |> as.numeric(), 
+for (country in G7_countries){
+  # current placeholders, will load GP from Stan with optimal hyperparameters
+  rho <- 1
+  alpha <- 1
+  sigma <- 0.0005
+  
+  # load in observed data
+  data_full <-  dataload(datafile, topic_of_interest, country, start_date)
+  dates_in_use <-  data_full$dates_in_use
+  
+  # merge and remove NA values
+  data <- data.frame("x" = data_full$dates_in_use |> as.numeric(), 
                    data_full$data) 
-colnames(data)[2] <- "y"
-data <- data |> filter(!is.na(y))
-x <- data$x
-y <- data$y
-results_list <- fit_GP(x, y, nsim = nsim, sigma = sigma, tau = tau, l = l)
-y_output <- results_list[["y_output"]]
-conf_bounds <- results_list[["conf_bounds"]]
+  colnames(data)[2] <- "y"
+  data <- data |> filter(!is.na(y))
+  
+  # fit GP with optimal values
+  x <- data$x
+  y <- data$y
+  results_list <- fit_GP(x, y, sigma = sigma, alpha = alpha, rho = rho)
+  y_output <- results_list[["y_output"]]
+  conf_bounds <- results_list[["conf_bounds"]]
+  
+  plots <- ggplot() +
+    geom_line(data = y_output, 
+              mapping = aes(x = x_pred, y = y, group = sim), 
+              colour= "grey") +
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = conf_1), 
+              colour = "red")+
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = conf_2), 
+              colour = "red")+
+    geom_point(data = data.frame("x" = as.Date(x), y), 
+               mapping = aes(x, y), 
+               colour = "black")+
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = mean_pred), 
+              colour = "black") +
+    theme_minimal() +
+    ggtitle(paste("Country:", country, "Topic:", topic_of_interest), 
+            subtitle = paste("Sigma:", sigma, "Alpha:", alpha, "Rho:", rho)) +
+    ylab("DTP")+
+    xlab("Date")
+  print(plots)
+}
 
-ggplot() +
-  geom_line(data = y_output, mapping = aes(x = x_pred, y = y, group = sim), colour= "grey") +
-  geom_line(data = conf_bounds, mapping = aes(x = x_pred, y = conf_1), colour = "red")+
-  geom_line(data = conf_bounds, mapping = aes(x = x_pred, y = conf_2), colour = "red")+
-  geom_point(data = data.frame("x" = as.Date(x), y), mapping = aes(x, y), colour = "black")+
-  geom_line(data = conf_bounds, mapping = aes(x = x_pred, y = mean_pred), colour = "black") +
-  theme_minimal() +
-  ggtitle(paste("Country:", countries2use, "Topic:", topic_of_interest), 
-          subtitle = paste("Sigma:", sigma, "tau:", tau, "L:", l)) +
-  ylab("DTP")+
-  xlab("Date")
+```
+```{r top3start}
+#| echo: false
+topic_of_interest <- candidate_topics[3]
+start_date = ymd("2008-11-01")
+# otherwise the month before the first mention in the dataset.
+if(topic_of_interest=="brexit"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="covid"){
+  start_date = ymd("2020-01-01")
+}
+if(topic_of_interest=="cbdc"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="ukrain"){
+  start_date = ymd("2014-03-01")
+}
+```
+
+## Topic `r topic_of_interest`
+
+Results loop over the topics of interest and rely on having run the above code set across different topics.
+
+```{r top3fit}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+for (country in G7_countries){
+  # current placeholders, will load GP from Stan with optimal hyperparameters
+  rho <- 1
+  alpha <- 1
+  sigma <- 0.0005
+  
+  # load in observed data
+  data_full <-  dataload(datafile, topic_of_interest, country, start_date)
+  dates_in_use <-  data_full$dates_in_use
+  
+  # merge and remove NA values
+  data <- data.frame("x" = data_full$dates_in_use |> as.numeric(), 
+                   data_full$data) 
+  colnames(data)[2] <- "y"
+  data <- data |> filter(!is.na(y))
+  
+  # fit GP with optimal values
+  x <- data$x
+  y <- data$y
+  results_list <- fit_GP(x, y, sigma = sigma, alpha = alpha, rho = rho)
+  y_output <- results_list[["y_output"]]
+  conf_bounds <- results_list[["conf_bounds"]]
+  
+  plots <- ggplot() +
+    geom_line(data = y_output, 
+              mapping = aes(x = x_pred, y = y, group = sim), 
+              colour= "grey") +
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = conf_1), 
+              colour = "red")+
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = conf_2), 
+              colour = "red")+
+    geom_point(data = data.frame("x" = as.Date(x), y), 
+               mapping = aes(x, y), 
+               colour = "black")+
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = mean_pred), 
+              colour = "black") +
+    theme_minimal() +
+    ggtitle(paste("Country:", country, "Topic:", topic_of_interest), 
+            subtitle = paste("Sigma:", sigma, "Alpha:", alpha, "Rho:", rho)) +
+    ylab("DTP")+
+    xlab("Date")
+  print(plots)
+}
+
+```
+
+```{r top4start}
+#| echo: false
+topic_of_interest <- candidate_topics[4]
+start_date = ymd("2008-11-01")
+# otherwise the month before the first mention in the dataset.
+if(topic_of_interest=="brexit"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="covid"){
+  start_date = ymd("2020-01-01")
+}
+if(topic_of_interest=="cbdc"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="ukrain"){
+  start_date = ymd("2014-03-01")
+}
+```
+
+## Topic `r topic_of_interest`
+
+Results loop over the topics of interest and rely on having run the above code set across different topics.
+
+```{r top4fit}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+for (country in G7_countries){
+  # current placeholders, will load GP from Stan with optimal hyperparameters
+  rho <- 1
+  alpha <- 1
+  sigma <- 0.0005
+  
+  # load in observed data
+  data_full <-  dataload(datafile, topic_of_interest, country, start_date)
+  dates_in_use <-  data_full$dates_in_use
+  
+  # merge and remove NA values
+  data <- data.frame("x" = data_full$dates_in_use |> as.numeric(), 
+                   data_full$data) 
+  colnames(data)[2] <- "y"
+  data <- data |> filter(!is.na(y))
+  
+  # fit GP with optimal values
+  x <- data$x
+  y <- data$y
+  results_list <- fit_GP(x, y, sigma = sigma, alpha = alpha, rho = rho)
+  y_output <- results_list[["y_output"]]
+  conf_bounds <- results_list[["conf_bounds"]]
+  
+  plots <- ggplot() +
+    geom_line(data = y_output, 
+              mapping = aes(x = x_pred, y = y, group = sim), 
+              colour= "grey") +
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = conf_1), 
+              colour = "red")+
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = conf_2), 
+              colour = "red")+
+    geom_point(data = data.frame("x" = as.Date(x), y), 
+               mapping = aes(x, y), 
+               colour = "black")+
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = mean_pred), 
+              colour = "black") +
+    theme_minimal() +
+    ggtitle(paste("Country:", country, "Topic:", topic_of_interest), 
+            subtitle = paste("Sigma:", sigma, "Alpha:", alpha, "Rho:", rho)) +
+    ylab("DTP")+
+    xlab("Date")
+  print(plots)
+}
+
+```
+
+```{r top5start}
+#| echo: false
+topic_of_interest <- candidate_topics[5]
+start_date = ymd("2008-11-01")
+# otherwise the month before the first mention in the dataset.
+if(topic_of_interest=="brexit"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="covid"){
+  start_date = ymd("2020-01-01")
+}
+if(topic_of_interest=="cbdc"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="ukrain"){
+  start_date = ymd("2014-03-01")
+}
+```
+
+## Topic `r topic_of_interest`
+
+Results loop over the topics of interest and rely on having run the above code set across different topics.
+
+```{r top5fit}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+for (country in G7_countries){
+  # current placeholders, will load GP from Stan with optimal hyperparameters
+  rho <- 1
+  alpha <- 1
+  sigma <- 0.0005
+  
+  # load in observed data
+  data_full <-  dataload(datafile, topic_of_interest, country, start_date)
+  dates_in_use <-  data_full$dates_in_use
+  
+  # merge and remove NA values
+  data <- data.frame("x" = data_full$dates_in_use |> as.numeric(), 
+                   data_full$data) 
+  colnames(data)[2] <- "y"
+  data <- data |> filter(!is.na(y))
+  
+  # fit GP with optimal values
+  x <- data$x
+  y <- data$y
+  results_list <- fit_GP(x, y, sigma = sigma, alpha = alpha, rho = rho)
+  y_output <- results_list[["y_output"]]
+  conf_bounds <- results_list[["conf_bounds"]]
+  
+  plots <- ggplot() +
+    geom_line(data = y_output, 
+              mapping = aes(x = x_pred, y = y, group = sim), 
+              colour= "grey") +
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = conf_1), 
+              colour = "red")+
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = conf_2), 
+              colour = "red")+
+    geom_point(data = data.frame("x" = as.Date(x), y), 
+               mapping = aes(x, y), 
+               colour = "black")+
+    geom_line(data = conf_bounds, 
+              mapping = aes(x = x_pred, y = mean_pred), 
+              colour = "black") +
+    theme_minimal() +
+    ggtitle(paste("Country:", country, "Topic:", topic_of_interest), 
+            subtitle = paste("Sigma:", sigma, "Alpha:", alpha, "Rho:", rho)) +
+    ylab("DTP")+
+    xlab("Date")
+  print(plots)
+}
 
 ```
 :::
