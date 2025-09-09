@@ -17,18 +17,19 @@ Run_PT_SS = function(niter,  #MCMC iterations
                   data, # raw data with potential missing values
                   P = 1, # max lag
                   nstops = 10,
-                  Goal_acceptance_rate = c(A = .23,
+                  Goal_acceptance_rate = c(A = .23, 
                                            B = .23,
                                            C = .23,
                                            sigma2_delta = .44,
-                                           sigma2_e     = .44,
+                                           sigma2_e     = .44,# ignored if held fixed. See "sample_sigma_e"
                                            pa           = .44,
                                            X            = .23,
                                            Xstar        = .23), # target sampling acceptance rates
                   filename = NULL,
                   step_var = rep(0.1,8),# initial guess at transition variance can be user specified.
                   CCor = diag(1, ncol(data)*(ncol(data)-1)),# potential correlation structure for C if known 
-                  sigma2_pars = c(delta = .01, e = .0001) # prior parameters for the sigmas.
+                  sigma2_pars = c(delta = .01, e = .0001), # prior parameters for the sigmas.  Second one is ignored if held fixed. See "sample_sigma_e"
+                  sample_sigma_e = c(TRUE, .0001) # logical deciding if it should be held fixed, if so then the value to fix
           ){
 # Perform parallel tempering or vanilla MCMC to obtain samples from the model:
 #
@@ -501,10 +502,13 @@ Run_PT_SS = function(niter,  #MCMC iterations
       
       ##### Sigma2_e #####
       #
+      # May be turned off completely.  See input "sample_sigma_e"
+      #
       # This can probably be done directly from the conditional distribution, 
       # This is not wrong, just inefficient
       #
       # propose a value from an easy distribution: truncated Normal.  
+      if(sample_sigma_e[1]){
       sigma2_e_prop          = rtruncnorm(n = 1, a=0, b=Inf, 
                                               mean = theta_use[sigma2_e_index],
                                               sd = step_var[[chain]][5])
@@ -539,10 +543,9 @@ Run_PT_SS = function(niter,  #MCMC iterations
         theta_use               = theta_prop
         log_post_old            = log_post_prop
       }
-      
-      
-      
-      
+      }else{# do not bother sampling.  Just hold it fixed.  See input "sample_sigma_e"
+        theta_use[sigma2_e_index] = sample_sigma_e[2]
+      }
       
       
       ##### Lock in the Output ##### 

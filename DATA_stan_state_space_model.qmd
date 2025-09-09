@@ -1,0 +1,1217 @@
+---
+title: "Bayesian State Space Model in Stan"
+format: 
+  html:
+    html-math-method: mathjax
+    echo: true
+    eval: true
+---
+
+
+## Assessment
+
+State Space models are much better in that they seem to catch some of the dynamics.  This is still running so these results should be considered preliminary.   Mostly the sampling of the system states was not efficiently implemented.  Results to be updated.
+
+## Basics
+
+```{r version}
+#| code-fold: true
+#| message: false
+#| warning: false
+version
+library(tidyverse)
+library(lubridate)
+library(rstan)
+library(coda) # diagnostics
+library(reshape2) # reshaping matrices
+library(bayesplot) # stan output plots in ggplot
+options(mc.cores = 4)
+rstan_options(auto_write = TRUE)
+
+source("MCMC_SS_functions.R")     # Just used for data loading
+
+```
+
+
+## State Space Model:
+
+State space models are a generalization of time series models, where the observations are driven by an underlying stochastic transition process, but may be observed with noise.
+
+
+A state space formulation implies that there is some stochastic process for the mean and we observe some stochastic process.   The observation process allows for the scenario where a Bank doesn't give speeches in a given month ($\alpha = 0$) or something else comes up.  The transition process models the evolution of topic importance, whereas the observation process allows those topics to be observed with noise.  Here "with noise" implies that a central bank only gives a sample of speeches in any time period.
+
+
+
+
+#### Observation process:
+
+Observed Document Term Proportion $DTP_{ijt}$, for topic $i$, country $j$ at time $t$ are modelled as noisy realizations of an underlying state process $X_{ijt}$:
+
+$$DTP_{ijt} = \alpha_{ijt} \left[X_{ijt} + e_{i,j,t}\right], \ \ \ where\ \ \ e_{ijt}\sim N(0,\sigma^2_{e,i}), \ \ \ and \ \ \ \alpha_{ijt} \{0,1\}$$
+The use of $\alpha$ allows observations to be turned on / off. 
+
+
+#### Un-observable Transition process:
+
+Dropping the reliance on the topic index _i_, the model transitions ahead based on the  stochastic process: 
+
+$$X_{jt} = a_j+b_{j} * X_{jt-1} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * X_{kt-1}+ \delta_{jt}.$$
+Using matrix notation this can be written with a $J$ by $J$ matrix $\Theta$ with diagonal elements corresponding to $b_j$ and off diagonals  $c_{jk}$, along with the $J$ by 1 vector of intercepts $A$ and vector of stochastic process noise realizations $\delta_t$:
+$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
+The use of **Multivariate Normal** with correlation $\Sigma_\delta$ vs something with independent elements is a modelling decision.  I don't think that it will interfere with estimation of $c_{jk}$.  The term $c_{jk}$ tracks how the past of country $k$ impacts the present of country $j$, whereas any correlation structure in $\Sigma_\delta$ relates more to external events that both banks are looking at when crafting speeches.
+
+
+The un-observable transition process _should_ track the underlying process better than a VAR model because it splits apart the states and observations.  Both will be about the same when it comes to prediction.
+
+
+Note that we already know the values of $\alpha_{jt} \in\{0,1\}$  but we will model it as $\alpha_{jt}\sim Bernoulli (p_a)$.   **In a future version**, maybe we set up $p_a$ to be time varying, allowing for topics like covid and the unprovoked invasion of Ukraine to be turned off / on.  
+When we observe zero for this topic or we do not observe a speech, then we have $\alpha_{jt}=0$ and $\alpha_{jt}=1$ otherwise.
+
+
+#### The Complete data likelihood:
+
+$$P(X_{ijt},\ldots X_{ij0},DTP_{ijt},\ldots,DTP_{ij0}\mid \Theta, p_a, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}) = P(\alpha\mid p_a)P(X_{ij0})\prod_{s=1}^t P(X_{ijs}\mid X_{ijs-1}, \Theta)P(DTP_{ijs}\mid\Theta, p_a, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i},X_{ijs})$$
+
+
+#### The Observed data (marginal) likelihood:
+
+$$P(DTP_{ijt},\ldots,DTP_{ij0},\alpha_{jt}\mid \Theta, p_a, \sigma^2_{\epsilon}, \sigma^2_{\delta}) = \int_\chi\cdots\int_\chi P(\alpha\mid p_a)P(X_{j0})\prod_{s=1}^t P(X_{js}\mid X_{js-1} \Theta)\left[P(DTP_{js}\mid\Theta, p_a, \sigma^2_{\epsilon}, \sigma^2_{\delta},X_{js}))\right]^{\alpha_{jt}}dX_{j0}\cdots dX_{jT}$$
+
+### Frequentist Approach: 
+
+We could use a Laplace Approximation to integrate out the nuissance parameters $X$ and the unobserved $DTP$ values to obtain the MLE for $\Theta, \alpha, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}$.  This becomes a numerical optimization routing where the optimizer needs to handle the Laplace approximation at each iteration until the marginal likelihood is optimized.  The R library _TMB_ compiles models in C and runs quickly if you want to try it.
+
+#### Bayesian Approach:
+
+Bayesian tools provide easy access to non-asymptotic uncertainty estimates and readily allow for unspecified correlations between parameters. Bayesian approaches also allow for non-approximate (well, less-approximate) integration for marginal likelihoods.
+
+Include priors on structural parameters $X_{ij0},\Theta, p_a, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}$, then sample from the joint posterior of all structural parameters and the states (nuissance parameters).  Discard the samples from the nuissance parameters to marginalize / integrate them out leaving a sample from $P(X_{ij0},\Theta, \alpha, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i} \mid DTP_{ij1},...,DTP_{ijt})$.   The sampler may be inefficient and take a while to converge unless you get fancy.  Typically people use Sequential Monte Carlo, but I'm using a faster to code, slower to run Parallel Tempering sampler.  
+
+
+
+
+
+## Priors
+
+The coefficients $\theta=[a,b,c]$, process evolution noise $\sigma_{\delta}^2$ observational error, $\sigma^2_{e}$, initial unobserved process $X_{j0}$, and the probability of observation $p_a$, all need priors, of which we use these models:
+
+
+$$a,b,c\overset{iid}{\sim }N(0,1)$$
+$$\sigma_{\delta}\sim half-Normal(0,.25), \ \ with \ \ mean\ \  0.199$$
+
+$$\sigma_{e}\sim half-Normal(0,.008), \ \ with \ \ mean \ \ 0.0064$$
+
+$X_{j0} \overset{iid}{\sim }N(0,1)$$
+
+
+## User Defined Options
+
+Note that there are some switches that a user may define here.  In this code block the user defines:
+
+1. the location and file containing the time series of topics.
+2. the topic of interest
+3. the countries to use
+4. The first month to use.
+5. deciding if the log or raw data should be used.
+
+```{r user_defined_options}
+# 1. location and filename
+datafolder = "cbspeeches-main/inst/data-misc/"
+datafile   = paste0(datafolder,"nmf-time-series-g20.csv")
+
+#2. topic of interest
+candidate_topics = c("inflat" ,"brexit", "covid", "cbdc", "ukrain" )
+topic_of_interest = candidate_topics[3]
+
+#3 countries to use.  
+# possible option
+G7_countries = c ("Canada", "France", "Germany", "Italy", "Japan",  "United Kingdom","United States")
+# possible option
+CUSA = c ("Canada","United States")
+# actual decision:
+countries2use = G7_countries# unique(dataset$country)
+
+#4 first month to use, 
+# start of dataset
+start_date = ymd("2008-11-01")
+# otherwise the month before the first mention in the dataset.
+if(topic_of_interest=="brexit"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="covid"){
+  start_date = ymd("2020-01-01")
+}
+if(topic_of_interest=="cbdc"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="ukrain"){
+  start_date = ymd("2014-03-01")
+}
+
+#5  prefix for naming output filenames
+prefix = "stan_" 
+
+```
+
+
+
+
+## Data Loading:
+
+
+```{r dataload}
+#| warning: false
+
+#. just loading and maybe transforming the data:
+data_full = dataload(datafile, topic_of_interest, countries2use, start_date)
+dates_in_use = data_full$dates_in_use
+if(prefix == "log"){
+  data         = log(data_full$data)
+}else{
+  data = data_full$data
+}
+```
+
+
+
+
+
+
+## MCMC 
+
+
+
+Set up the iterations, transition variances and frequency of tuning thereof, temperatures for running the tempering.
+
+```{r preamble}
+#| code-fold: false
+niter = 40000     # total number of iterations
+
+```
+
+Run the MCMC using **stan**.  Stan uses _Hamiltonian Monte Carlo_, so this _should_ be more efficient than Metropolis Hastings.
+
+
+```{r MCMC}
+#| code-fold: true
+#| eval: false
+
+
+filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),"_",niter,".Rdata")
+print(filename)
+
+
+T1 = Sys.time()
+
+# Set up the data so that NAs and zeros are treated the same way.
+data[is.na(data)] = 0
+colnames(data) = NULL
+
+# Prepare list for Stan
+stan_data <- list(
+  T = nrow(data),
+  K = ncol(data),
+  I = diag(ncol(data)),
+  y_obs = data
+)
+
+# Compile and run
+fit <- stan(
+  file = "state_space.stan",
+  data = stan_data,
+  iter = niter, 
+  init = "vb",
+  warmup = niter/2,
+  chains = 4,
+  algorithm = "NUTS",
+  control = list(adapt_delta   = .99,
+                 max_treedepth = 30)
+)
+
+# Summarize results
+print(fit, pars = c("theta"))
+
+
+elapsed = Sys.time() - T1 
+cat(paste("total compute time: ", round(as.numeric(elapsed, units = "hours"),2)," hours."))
+save.image(filename)
+
+
+```
+
+
+## Make some plots:
+
+In all cases discard the part of the MCMC where chains were being adapted.
+
+
+
+:::: panel-tabset
+
+```{r, cache = TRUE}
+#| echo: false
+
+topic_of_interest = candidate_topics[1]
+candidate_files_to_load = list.files(pattern = paste0("stan_2chain_dataSS_",topic_of_interest,"_results_Canada_France_Germany_Italy_Japan_United Kingdom_United States_60000"))
+```
+
+## Topic `r topic_of_interest`
+
+
+Results loop over the topics of interest and rely on having run the above code set across different topics.
+
+```{r }
+#| code-fold: true
+runtime = filesloaded = iters_run  =  rep(NA, length(candidate_files_to_load))
+fitted = array(NA, dim = c(niter,length(candidate_files_to_load), 1451))
+for(lp in 1:length(candidate_files_to_load)){
+  filename = candidate_files_to_load[lp]
+  load(filename)
+  runtime[lp]      = elapsed
+  filesloaded[lp]  = filename 
+  iters_run[lp]    = niter
+  fitted[,lp,]     = extract(fit, 
+                                permuted = FALSE, 
+                                inc_warmup = TRUE)
+    
+    
+    #as.matrix(fit) #|> 
+                          #as_tibble()|> 
+                          #select(-c("lp__"))|>
+                          #select(where(~ n_distinct(.) > 1)) |> 
+                          #as.matrix()
+}
+  
+  
+```
+
+Total compute time: `r round(as.numeric(elapsed, units = "hours"),2)` hours.
+
+
+
+```{r }
+#| code-fold: true
+#| output: asis
+
+# diagnostics around the ess
+# first load all the Markov chains,
+# then extract the relevant parameter to check.
+# stack the chains into columns for the matrix
+# Then check out the ESS_bulk, which is king of a measure of sampling
+as.matrix(fit) |> 
+  as_tibble()|> 
+  select(-c("lp__"))|>
+  select(where(~ n_distinct(.) > 1)) |> 
+  as.matrix()|> ess_bulk()
+
+
+results = extract(fit, 
+                  permuted = FALSE, 
+                  inc_warmup = FALSE)
+matrix_of_draws <- results |> matrix(ncol = dim(results)[3])
+
+parnames = dimnames(fit)$parameters
+
+Niter          = matrix_of_draws |> nrow()
+A_index             = parnames  |> grep(pattern = "^A")
+theta_index         = parnames  |> grep(pattern = "^theta")
+sigma_obs_index     = parnames  |> grep(pattern = "sigma_obs")   
+sigma_proc_index    = parnames  |> grep(pattern = "sigma_proc")
+
+# Note that L_corr is the lower triangle cholesky decomposition of the correlation matrix so that the diagonals and upper triangle elements will be all zeros and are not sampled.
+L_corr_index = NULL
+for(rows in 2:length(A_index)){
+  for(cols in 1:(rows-1)){
+    L_corr_index = c(L_corr_index,
+                     grep(parnames , pattern = paste0("L_corr\\[",rows,",",cols)))
+  }
+}
+L_proc_index  = parnames  |> grep(pattern = "L_proc")
+    
+X_index             = parnames |> grep(pattern = "^X")
+posterior = as.array(results)
+check_hmc_diagnostics(fit)
+```
+
+
+
+
+
+MCMC Diagnostics, everything
+
+```{r}
+#| cache: true
+mcmc_rhat(rhat = rhat(fit)) + yaxis_text(hjust = 0)
+```
+
+
+::: {.callout-note collapse=true title="A"}
+
+```{r}
+#| cache: true
+mc1 = results[,4,A_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,A_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,A_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,A_index]|> as.matrix() |> as.mcmc()
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.plot(mclist)
+gelman.diag(mclist)
+
+
+```
+:::
+
+::: {.callout-note collapse=true title="theta"}
+
+
+```{r}
+#| cache: true
+mc1 = results[,4,theta_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,theta_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,theta_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,theta_index]|> as.matrix() |> as.mcmc()
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.diag(mclist)
+```
+
+:::
+
+
+::: {.callout-note collapse=true title="observational noise"}
+
+The $\sigma_{\e}$ aka sigma\_obs, the observational noise:
+
+```{r}
+#| cache: true
+mc1 = results[,4,sigma_obs_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,sigma_obs_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,sigma_obs_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,sigma_obs_index]|> as.matrix() |> as.mcmc()
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.plot(mclist)
+gelman.diag(mclist)
+```
+
+:::
+
+
+
+::: {.callout-note collapse=true title="process noise"}
+
+The $\sigma_{\delta}$ aka sigma\_proc.  These are the diagonal elements of the process noise.
+```{r}
+#| cache: true
+mc1 = results[,4,sigma_proc_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,sigma_proc_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,sigma_proc_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,sigma_proc_index]|> as.matrix() |> as.mcmc()
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.plot(mclist)
+gelman.diag(mclist)
+```
+
+:::
+
+
+
+
+::: {.callout-note collapse=true title="process noise matrix"}
+Elements of the correlation matrix from the Cholesky factorization that is used in stan:
+```{r}
+#| cache: true
+#| code-fold: true
+mc1 = results[,4,L_corr_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,L_corr_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,L_corr_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,L_corr_index]|> as.matrix() |> as.mcmc()
+
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.plot(mclist)
+gelman.diag(mclist)
+```
+
+:::
+
+
+Take a closer look at the correlation structure of the process noise.  These are the lements of $\Sigma_\delta$ in the process evolution:
+
+$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
+
+```{r}
+#| cache: true
+#| code-fold: true
+
+
+##### Just go right after L_proc.  It's lower triangle since it's used as 
+# a cholesky decomp of the full covariance (and correlation) in the normal transitions
+meanies = get_posterior_mean(fit)
+Lmeans = meanies[L_proc_index,"mean-all chains"]
+L_proc_mean_mat = matrix(0, nrow = length(A_index), ncol =  length(A_index))
+for(rows in 1:length(A_index)){
+  for(cols in 1:(rows)){
+    L_proc_mean_mat[rows,cols] = Lmeans[paste0("L_proc[",rows,",",cols,"]")]
+  }
+}
+# reconstruct by undoing the cholesky decomp: https://mc-stan.org/docs/functions-reference/distributions_over_unbounded_vectors.html#multi-normal-cholesky-fun
+Xcovmat = L_proc_mean_mat%*% t(L_proc_mean_mat)
+
+colnames(Xcovmat) = countries2use
+rownames(Xcovmat) = countries2use
+df <- melt(Xcovmat)
+colnames(df) <- c("Row", "Column", "Value")
+ggplot(df, aes(x = Column, y = Row, fill = Value)) +
+  geom_tile() +
+  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
+  coord_fixed() +      # Keep square tiles
+  labs(title = "Mean Process Covariance between countries")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+diags = 1/sqrt(diag(Xcovmat))
+cormat = diag(diags)%*%Xcovmat%*% diag(diags)
+
+
+colnames(cormat) = countries2use
+rownames(cormat) = countries2use
+df <- melt(cormat)
+colnames(df) <- c("Row", "Column", "Value")
+ggplot(df, aes(x = Column, y = Row, fill = Value)) +
+  geom_tile() +
+  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
+  coord_fixed() +      # Keep square tiles
+  labs(title = "Mean Process Correlation between countries")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+
+
+
+
+Take a closer look at the relationship between countries.  These are the lements of $\Theta$ in the process evolution:
+
+$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
+
+```{r}
+#| cache: true
+#| code-fold: true
+
+
+
+Tmeans = meanies[theta_index,"mean-all chains"]
+Tmean_mat = matrix(0, nrow = length(A_index), ncol =  length(A_index))
+for(rows in 1:length(A_index)){
+  for(cols in 1:length(A_index)){
+    Tmean_mat[rows,cols] = Tmeans[paste0("theta[",rows,",",cols,"]")]
+  }
+}
+
+
+colnames(Tmean_mat) = countries2use
+rownames(Tmean_mat) = countries2use
+df <- melt(Tmean_mat)
+colnames(df) <- c("Impact_on", "Lag1", "Value")
+ggplot(df, aes(x = Lag1, y = Impact_on, fill = Value)) +
+  geom_tile() +
+  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
+  coord_fixed() +      # Keep square tiles
+  labs(title = "Mean Process Impact (Theta)")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+```
+
+
+
+
+
+Some more density plots.  Ideally these are all the same.
+
+```{r}
+#| cache: true
+
+bayesplot::mcmc_dens_overlay(posterior,pars = "sigma_obs")
+
+
+```
+
+
+
+Posterior distribution of states.
+
+```{r}
+#| cache: true
+#| code-fold: true
+
+Nsam = 1000
+NChain = dim(results)[2]
+niter_per_chain = dim(results)[1]
+Xsamples = matrix(NA, nrow = Nsam*NChain, ncol = length(X_index))
+logpost_samp = NA
+for(chain in 1:NChain){
+    Xsamples[(chain-1)*Nsam+(1:Nsam),] = results[sample(1:niter_per_chain, size = Nsam),chain,X_index]
+}
+
+colnames(Xsamples) = grep(parnames,pattern = "^X", value = TRUE)
+
+
+
+
+
+for(country in 1:length(countries2use)){
+matplot(x = dates_in_use,
+        y = t(Xsamples[,grep(colnames(Xsamples),
+                           pattern = paste0(country,"\\]"))]),
+        type = 'l',  
+        main = paste("posterior predictive fit for country",countries2use[country]),
+  ylim = c(-.1,.5), ylab = "Topic prevalence")
+points(x = dates_in_use,
+       data[,country], 
+       pch = "*", cex = 3, col= "red")
+}
+
+```
+
+
+
+
+
+
+```{r, cache = TRUE}
+#| echo: false
+
+topic_of_interest = candidate_topics[1]
+candidate_files_to_load = list.files(pattern = paste0("stan_2chain_dataSS_",topic_of_interest,"_results_Canada_France_Germany_Italy_Japan_United Kingdom_United States_60000"))
+  
+```
+
+## Topic `r topic_of_interest`
+
+
+Results loop over the topics of interest and rely on having run the above code set across different topics.
+
+```{r }
+#| code-fold: true
+
+load(filename)
+print(filename)
+```
+
+Total compute time: `r round(as.numeric(elapsed, units = "hours"),2)` hours.
+
+
+
+```{r }
+#| code-fold: true
+#| output: asis
+
+
+check_energy(fit)
+get_bfmi(fit); # diagnostic.  See: https://mc-stan.org/learn-stan/diagnostics-warnings.html#bfmi-low
+
+results = extract(fit, 
+                  permuted = FALSE, 
+                  inc_warmup = FALSE)
+matrix_of_draws <- results |> matrix(ncol = dim(results)[3])
+
+parnames = dimnames(fit)$parameters
+
+Niter          = matrix_of_draws |> nrow()
+A_index             = parnames  |> grep(pattern = "^A")
+theta_index         = parnames  |> grep(pattern = "^theta")
+sigma_obs_index     = parnames  |> grep(pattern = "sigma_obs")   
+sigma_proc_index    = parnames  |> grep(pattern = "sigma_proc")
+
+# Note that L_corr is the lower triangle cholesky decomposition of the correlation matrix so that the diagonals and upper triangle elements will be all zeros and are not sampled.
+L_corr_index = NULL
+for(rows in 2:length(A_index)){
+  for(cols in 1:(rows-1)){
+    L_corr_index = c(L_corr_index,
+                     grep(parnames , pattern = paste0("L_corr\\[",rows,",",cols)))
+  }
+}
+L_proc_index  = parnames  |> grep(pattern = "L_proc")
+    
+X_index             = parnames |> grep(pattern = "^X")
+posterior = as.array(results)
+check_hmc_diagnostics(fit)
+```
+
+
+
+
+
+MCMC Diagnostics, everything
+
+```{r}
+#| cache: true
+mcmc_rhat(rhat = rhat(fit)) + yaxis_text(hjust = 0)
+```
+
+
+::: {.callout-note collapse=true title="A"}
+
+```{r}
+#| cache: true
+mc1 = results[,4,A_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,A_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,A_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,A_index]|> as.matrix() |> as.mcmc()
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.plot(mclist)
+gelman.diag(mclist)
+
+
+```
+:::
+
+::: {.callout-note collapse=true title="theta"}
+
+
+```{r}
+#| cache: true
+mc1 = results[,4,theta_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,theta_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,theta_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,theta_index]|> as.matrix() |> as.mcmc()
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.diag(mclist)
+```
+
+:::
+
+
+::: {.callout-note collapse=true title="observational noise"}
+
+The $\sigma_{\e}$ aka sigma\_obs, the observational noise:
+
+```{r}
+#| cache: true
+mc1 = results[,4,sigma_obs_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,sigma_obs_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,sigma_obs_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,sigma_obs_index]|> as.matrix() |> as.mcmc()
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.plot(mclist)
+gelman.diag(mclist)
+```
+
+:::
+
+
+
+::: {.callout-note collapse=true title="process noise"}
+
+The $\sigma_{\delta}$ aka sigma\_proc.  These are the diagonal elements of the process noise.
+```{r}
+#| cache: true
+mc1 = results[,4,sigma_proc_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,sigma_proc_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,sigma_proc_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,sigma_proc_index]|> as.matrix() |> as.mcmc()
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.plot(mclist)
+gelman.diag(mclist)
+```
+
+:::
+
+
+
+
+::: {.callout-note collapse=true title="process noise matrix"}
+Elements of the correlation matrix from the Cholesky factorization that is used in stan:
+```{r}
+#| cache: true
+#| code-fold: true
+mc1 = results[,4,L_corr_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,L_corr_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,L_corr_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,L_corr_index]|> as.matrix() |> as.mcmc()
+
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.plot(mclist)
+gelman.diag(mclist)
+```
+
+:::
+
+
+Take a closer look at the correlation structure of the process noise.  These are the lements of $\Sigma_\delta$ in the process evolution:
+
+$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
+
+```{r}
+#| cache: true
+#| code-fold: true
+
+
+##### Just go right after L_proc.  It's lower triangle since it's used as 
+# a cholesky decomp of the full covariance (and correlation) in the normal transitions
+meanies = get_posterior_mean(fit)
+Lmeans = meanies[L_proc_index,"mean-all chains"]
+L_proc_mean_mat = matrix(0, nrow = length(A_index), ncol =  length(A_index))
+for(rows in 1:length(A_index)){
+  for(cols in 1:(rows)){
+    L_proc_mean_mat[rows,cols] = Lmeans[paste0("L_proc[",rows,",",cols,"]")]
+  }
+}
+# reconstruct by undoing the cholesky decomp: https://mc-stan.org/docs/functions-reference/distributions_over_unbounded_vectors.html#multi-normal-cholesky-fun
+Xcovmat = L_proc_mean_mat%*% t(L_proc_mean_mat)
+
+colnames(Xcovmat) = countries2use
+rownames(Xcovmat) = countries2use
+df <- melt(Xcovmat)
+colnames(df) <- c("Row", "Column", "Value")
+ggplot(df, aes(x = Column, y = Row, fill = Value)) +
+  geom_tile() +
+  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
+  coord_fixed() +      # Keep square tiles
+  labs(title = "Mean Process Covariance between countries")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+diags = 1/sqrt(diag(Xcovmat))
+cormat = diag(diags)%*%Xcovmat%*% diag(diags)
+
+
+colnames(cormat) = countries2use
+rownames(cormat) = countries2use
+df <- melt(cormat)
+colnames(df) <- c("Row", "Column", "Value")
+ggplot(df, aes(x = Column, y = Row, fill = Value)) +
+  geom_tile() +
+  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
+  coord_fixed() +      # Keep square tiles
+  labs(title = "Mean Process Correlation between countries")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+
+
+
+
+Take a closer look at the relationship between countries.  These are the lements of $\Theta$ in the process evolution:
+
+$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
+
+```{r}
+#| cache: true
+#| code-fold: true
+
+
+
+Tmeans = meanies[theta_index,"mean-all chains"]
+Tmean_mat = matrix(0, nrow = length(A_index), ncol =  length(A_index))
+for(rows in 1:length(A_index)){
+  for(cols in 1:length(A_index)){
+    Tmean_mat[rows,cols] = Tmeans[paste0("theta[",rows,",",cols,"]")]
+  }
+}
+
+
+colnames(Tmean_mat) = countries2use
+rownames(Tmean_mat) = countries2use
+df <- melt(Tmean_mat)
+colnames(df) <- c("Impact_on", "Lag1", "Value")
+ggplot(df, aes(x = Lag1, y = Impact_on, fill = Value)) +
+  geom_tile() +
+  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
+  coord_fixed() +      # Keep square tiles
+  labs(title = "Mean Process Impact (Theta)")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+```
+
+
+
+
+
+Some more density plots.  Ideally these are all the same.
+
+```{r}
+#| cache: true
+
+bayesplot::mcmc_dens_overlay(posterior,pars = "sigma_obs")
+
+
+```
+
+
+
+Posterior distribution of states.
+
+```{r}
+#| cache: true
+#| code-fold: true
+
+Nsam = 1000
+NChain = dim(results)[2]
+niter_per_chain = dim(results)[1]
+Xsamples = matrix(NA, nrow = Nsam*NChain, ncol = length(X_index))
+logpost_samp = NA
+for(chain in 1:NChain){
+    Xsamples[(chain-1)*Nsam+(1:Nsam),] = results[sample(1:niter_per_chain, size = Nsam),chain,X_index]
+}
+
+colnames(Xsamples) = grep(parnames,pattern = "^X", value = TRUE)
+
+
+
+
+
+for(country in 1:length(countries2use)){
+matplot(x = dates_in_use,
+        y = t(Xsamples[,grep(colnames(Xsamples),
+                           pattern = paste0(country,"\\]"))]),
+        type = 'l',  
+        main = paste("posterior predictive fit for country",countries2use[country]),
+  ylim = c(-.1,.5), ylab = "Topic prevalence")
+points(x = dates_in_use,
+       data[,country], 
+       pch = "*", cex = 3, col= "red")
+}
+
+```
+
+
+
+
+
+
+```{r, cache = TRUE}
+#| echo: false
+
+topic_of_interest = candidate_topics[1]
+candidate_files_to_load = list.files(pattern = paste0("stan_2chain_dataSS_",topic_of_interest,"_results_Canada_France_Germany_Italy_Japan_United Kingdom_United States_60000"))
+```
+
+## Topic `r topic_of_interest`
+
+
+Results loop over the topics of interest and rely on having run the above code set across different topics.
+
+```{r }
+#| code-fold: true
+
+load(filename)
+print(filename)
+```
+
+Total compute time: `r round(as.numeric(elapsed, units = "hours"),2)` hours.
+
+
+
+```{r }
+#| code-fold: true
+#| output: asis
+
+
+check_energy(fit)
+get_bfmi(fit); # diagnostic.  See: https://mc-stan.org/learn-stan/diagnostics-warnings.html#bfmi-low
+
+results = extract(fit, 
+                  permuted = FALSE, 
+                  inc_warmup = FALSE)
+matrix_of_draws <- results |> matrix(ncol = dim(results)[3])
+
+parnames = dimnames(fit)$parameters
+
+Niter          = matrix_of_draws |> nrow()
+A_index             = parnames  |> grep(pattern = "^A")
+theta_index         = parnames  |> grep(pattern = "^theta")
+sigma_obs_index     = parnames  |> grep(pattern = "sigma_obs")   
+sigma_proc_index    = parnames  |> grep(pattern = "sigma_proc")
+
+# Note that L_corr is the lower triangle cholesky decomposition of the correlation matrix so that the diagonals and upper triangle elements will be all zeros and are not sampled.
+L_corr_index = NULL
+for(rows in 2:length(A_index)){
+  for(cols in 1:(rows-1)){
+    L_corr_index = c(L_corr_index,
+                     grep(parnames , pattern = paste0("L_corr\\[",rows,",",cols)))
+  }
+}
+L_proc_index  = parnames  |> grep(pattern = "L_proc")
+    
+X_index             = parnames |> grep(pattern = "^X")
+posterior = as.array(results)
+check_hmc_diagnostics(fit)
+```
+
+
+
+
+
+MCMC Diagnostics, everything
+
+```{r}
+#| cache: true
+mcmc_rhat(rhat = rhat(fit)) + yaxis_text(hjust = 0)
+```
+
+
+::: {.callout-note collapse=true title="A"}
+
+```{r}
+#| cache: true
+mc1 = results[,4,A_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,A_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,A_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,A_index]|> as.matrix() |> as.mcmc()
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.plot(mclist)
+gelman.diag(mclist)
+
+
+```
+:::
+
+::: {.callout-note collapse=true title="theta"}
+
+
+```{r}
+#| cache: true
+mc1 = results[,4,theta_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,theta_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,theta_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,theta_index]|> as.matrix() |> as.mcmc()
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.diag(mclist)
+```
+
+:::
+
+
+::: {.callout-note collapse=true title="observational noise"}
+
+The $\sigma_{\e}$ aka sigma\_obs, the observational noise:
+
+```{r}
+#| cache: true
+mc1 = results[,4,sigma_obs_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,sigma_obs_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,sigma_obs_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,sigma_obs_index]|> as.matrix() |> as.mcmc()
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.plot(mclist)
+gelman.diag(mclist)
+```
+
+:::
+
+
+
+::: {.callout-note collapse=true title="process noise"}
+
+The $\sigma_{\delta}$ aka sigma\_proc.  These are the diagonal elements of the process noise.
+```{r}
+#| cache: true
+mc1 = results[,4,sigma_proc_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,sigma_proc_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,sigma_proc_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,sigma_proc_index]|> as.matrix() |> as.mcmc()
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.plot(mclist)
+gelman.diag(mclist)
+```
+
+:::
+
+
+
+
+::: {.callout-note collapse=true title="process noise matrix"}
+Elements of the correlation matrix from the Cholesky factorization that is used in stan:
+```{r}
+#| cache: true
+#| code-fold: true
+mc1 = results[,4,L_corr_index]|> as.matrix() |> as.mcmc()
+mc2 = results[,3,L_corr_index]|> as.matrix() |> as.mcmc()
+mc3 = results[,2,L_corr_index]|> as.matrix() |> as.mcmc()
+mc4 = results[,1,L_corr_index]|> as.matrix() |> as.mcmc()
+
+mclist = mcmc.list(mc1,mc2,mc3,mc4)
+# or use "As.mcmc.list" with that capital.
+gelman.plot(mclist)
+gelman.diag(mclist)
+```
+
+:::
+
+
+Take a closer look at the correlation structure of the process noise.  These are the lements of $\Sigma_\delta$ in the process evolution:
+
+$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
+
+```{r}
+#| cache: true
+#| code-fold: true
+
+
+##### Just go right after L_proc.  It's lower triangle since it's used as 
+# a cholesky decomp of the full covariance (and correlation) in the normal transitions
+meanies = get_posterior_mean(fit)
+Lmeans = meanies[L_proc_index,"mean-all chains"]
+L_proc_mean_mat = matrix(0, nrow = length(A_index), ncol =  length(A_index))
+for(rows in 1:length(A_index)){
+  for(cols in 1:(rows)){
+    L_proc_mean_mat[rows,cols] = Lmeans[paste0("L_proc[",rows,",",cols,"]")]
+  }
+}
+# reconstruct by undoing the cholesky decomp: https://mc-stan.org/docs/functions-reference/distributions_over_unbounded_vectors.html#multi-normal-cholesky-fun
+Xcovmat = L_proc_mean_mat%*% t(L_proc_mean_mat)
+
+colnames(Xcovmat) = countries2use
+rownames(Xcovmat) = countries2use
+df <- melt(Xcovmat)
+colnames(df) <- c("Row", "Column", "Value")
+ggplot(df, aes(x = Column, y = Row, fill = Value)) +
+  geom_tile() +
+  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
+  coord_fixed() +      # Keep square tiles
+  labs(title = "Mean Process Covariance between countries")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+diags = 1/sqrt(diag(Xcovmat))
+cormat = diag(diags)%*%Xcovmat%*% diag(diags)
+
+
+colnames(cormat) = countries2use
+rownames(cormat) = countries2use
+df <- melt(cormat)
+colnames(df) <- c("Row", "Column", "Value")
+ggplot(df, aes(x = Column, y = Row, fill = Value)) +
+  geom_tile() +
+  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
+  coord_fixed() +      # Keep square tiles
+  labs(title = "Mean Process Correlation between countries")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+
+
+
+
+Take a closer look at the relationship between countries.  These are the lements of $\Theta$ in the process evolution:
+
+$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
+
+```{r}
+#| cache: true
+#| code-fold: true
+
+
+
+Tmeans = meanies[theta_index,"mean-all chains"]
+Tmean_mat = matrix(0, nrow = length(A_index), ncol =  length(A_index))
+for(rows in 1:length(A_index)){
+  for(cols in 1:length(A_index)){
+    Tmean_mat[rows,cols] = Tmeans[paste0("theta[",rows,",",cols,"]")]
+  }
+}
+
+
+colnames(Tmean_mat) = countries2use
+rownames(Tmean_mat) = countries2use
+df <- melt(Tmean_mat)
+colnames(df) <- c("Impact_on", "Lag1", "Value")
+ggplot(df, aes(x = Lag1, y = Impact_on, fill = Value)) +
+  geom_tile() +
+  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
+  coord_fixed() +      # Keep square tiles
+  labs(title = "Mean Process Impact (Theta)")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+```
+
+
+
+
+
+Some more density plots.  Ideally these are all the same.
+
+```{r}
+#| cache: true
+
+bayesplot::mcmc_dens_overlay(posterior,pars = "sigma_obs")
+
+
+```
+
+
+
+Posterior distribution of states.
+
+```{r}
+#| cache: true
+#| code-fold: true
+
+Nsam = 1000
+NChain = dim(results)[2]
+niter_per_chain = dim(results)[1]
+Xsamples = matrix(NA, nrow = Nsam*NChain, ncol = length(X_index))
+logpost_samp = NA
+for(chain in 1:NChain){
+    Xsamples[(chain-1)*Nsam+(1:Nsam),] = results[sample(1:niter_per_chain, size = Nsam),chain,X_index]
+}
+
+colnames(Xsamples) = grep(parnames,pattern = "^X", value = TRUE)
+
+
+
+
+
+for(country in 1:length(countries2use)){
+matplot(x = dates_in_use,
+        y = t(Xsamples[,grep(colnames(Xsamples),
+                           pattern = paste0(country,"\\]"))]),
+        type = 'l',  
+        main = paste("posterior predictive fit for country",countries2use[country]),
+  ylim = c(-.1,.5), ylab = "Topic prevalence")
+points(x = dates_in_use,
+       data[,country], 
+       pch = "*", cex = 3, col= "red")
+}
+
+```
+
+
+
+
+
+
+::::
+
+
+## Running this on real data:
+
+- Code could be made more efficient using Sequential Monte Carlo. Stan is generally pretty good though.
+- Another reasonable solution is to go fully frequentist and optimize the marginal likelihood by integrating over the nuissance states **X** using Integrated Nested Laplace Approximation.  The package **tmb** is designed to do this quickly.
+- Use the script to extract the R code, because this will take a while to run. 
+
+```{r purl}
+#| eval: false
+
+knitr::purl("DATA_stan_state_space_model.qmd")
+
+
+```
