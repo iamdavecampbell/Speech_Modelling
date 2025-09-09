@@ -1,0 +1,564 @@
+---
+title: "modelling"
+format: 
+  html:
+    html-math-method: mathjax
+    echo: true
+    eval: true
+---
+
+## Basics
+
+```{r version}
+version
+library(tidyverse)
+library(truncnorm)
+```
+
+
+## Set up some fake data part 1
+
+Data is very arbitrary for now.  It just has the starting point and a lot of missing values.  We will sample from the model after those functions have been created and then insert some missing values.
+
+```{r fakedata}
+# Construct a starting point
+Nmissing = 25
+data = matrix(1, ncol = 5, nrow = 200) #preallocate
+data[1,]   = rnorm(5)                   #actual starting point
+miss       = sample(setdiff(1:((nrow(data))*ncol(data)), 1+nrow(data)*0:(ncol(data)-1)), Nmissing) # set up missing values (can't be starting point)
+data[miss] = NA             #place eventual missing values
+missing_index = is.na(data) # the most useful format is logicals for locations.
+data[-1,] = NA              # we'll simulate the whole dataset from here
+
+
+J      = ncol(data) #Ncountries
+P      = 1 # max lag
+Number_of_a = J
+Number_of_b = J*P
+Number_of_c = (J-1)*J 
+# for now we don't have any lags beyond 1 within the country (C) matrix because I'd need to think about
+# how to store and handle them in the propagation model
+
+theta_true  =  rnorm((Number_of_a+Number_of_b+Number_of_c), sd = .1) # 
+sigma2_true = .5
+
+```
+
+## The Model 
+
+We model the topic proportion for topic **i**, from country **j** at time **t**, $DTP_{ijt}$, as a function of lagged information, $DTP_{ijt-1}$, information from countries other than country $j\in 1,...,J$, $DTP_{i(-j)t-1}$, and exogenous variables, $X_{i,j,t}$,
+
+<!-- $$DTP_{ijt} = a + b * DTP_{ijt-1} + c * DTP_{i(-j)t-1}   + d * X_{i,j,t} + f * Country \times Month_{j,t} + e$$ -->
+$$DTP_{ijt} = a_j + \sum_pb_{jp} * DTP_{ijt-p} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * DTP_{ikt-1}   + d * X_{i,j,t}  + e_{i,j,t}, \ \ \ where\ \ \ e\sim N(0,\sigma^2_{i}).\label{eq:dtpijt}$$
+Where we drop the dependence on $i$ when it is not ambiguous.
+For the sake of making a first attempt at code, consider the case where we do not have external inputs $X_{i,j,t}$
+The model coefficients include the $J$ intercepts, $a=[a_1,...,a_J]$, the $J*P$ slopes for each country and lag combination $b=[b_{1,1},...,b_{j,p},...,b_{JP}]$, the $J*(J-1)$ coefficients connecting country $j$ to all other countries $[c_{1,2},...,c_{j,k},...,c_{J,J-1}]$,  the residual variance $\sigma^2$, and the initial condition for the model $DTP_0 = [DTP_{10},...,DTP_{J0}$.
+
+Assume for now that past information is encoded into the country of interest and that other countries do not need to be lagged.
+
+## Priors
+
+The coefficients $\theta=[a,b,c]$ and residual error, $\sigma^2_{i}$, all need priors, of which we use these models:
+
+
+$$a,b,c\overset{iid}{\sim }N(0,1)$$
+$$\sigma^2\overset{iid}{\sim }exponential(1)$$
+$$DTP_0 \overset{iid}{\sim }Uniform(0,1)$$
+
+
+```{r logprior}
+#| code-fold: true
+logprior = function(theta,sigma2,DTP0=NULL){
+  # $$a,b,c\overset{iid}{\sim }N(0,1)$$
+  # $$\sigma^2\overset{iid}{\sim }exponential(1)$$  
+  if(is.null(DTP0) && sigma2>0){
+    logprior = sum(dnorm(theta, log = TRUE)) - sigma2
+    # no time zero to be estimated
+  }else{
+    if(min(DTP0)>=0 && max(DTP0)<=1 && sigma2>0){
+        logprior = sum(dnorm(theta, log = TRUE)) - sigma2
+        # prior for time zero evaluation is uniform
+    }else{
+        logprior = -Inf
+    }
+  }
+  return(logprior)
+}
+```
+
+
+
+## Sampling Scheme
+
+Use Metropolis Hastings.  This will be slow to sample.
+
+
+- **sample DTP(0)** if missing using MH.  (propose DTP(0), propagate model forward conditional on $a,b,c,\sigma^2,DTP^*$, where $DTP^*$ are missing values and then make a decision.
+- **sample missing** $DTP^*$ using Gibbs step.  Do this by propagating the model forward from the previous time step.  This is exact sampling conditional on $a,b,c,\sigma^2,DTP^*, DTP0$.  
+- **sample parameters in blocks** $a,b,c$ using MH.  Propose values, then propagate the model forward, assessing the data fit as you go.  The likelihood should be estimated at each time point by comparing the observed point at time $t$ with the predicted likelihood of that time point conditional on all parameters and information from times $0,...,t-1$.  Probably split this apart into (1), the $j$ vector of $a$, (2) the **p** vectors $b_{jp}$, (3)the **J** vectors of $c_{j,k}$.
+- **sample the variance term** $\sigma^2$ using Metropolis Hastings, though later this can be done using a more efficient and direct Gibbs step.
+
+
+## Preallocate matrices:
+
+Set up MCMC parameters to start
+
+```{r preamble}
+
+niter = 25000     # total number of iterations
+nstops = 50     # number of times to assess the acceptance rate 
+accepts = matrix(0,nrow = nstops, ncol = 4)   # track acceptance count for each stop and for the components {A,B,C,sigma2}
+rate    = matrix(0,nrow = nstops, ncol = 4)   # track acceptance rate  for each stop and for the components {A,B,C,sigma2}  
+step_var = rep(.1,4)      # starting transition variance for {A,B,C, sigma2}
+```
+
+Set up the number of MCMC iterations and preallocate a space for iterations
+```{r preallocate}
+
+
+# J = ncol(data)
+# DTP0 is not yet used, but should work without too much coaxing
+# DTP0 = matrix(NA,ncol = J, nrow = niter )
+theta = matrix(NA, ncol = Number_of_a+Number_of_b+Number_of_c, nrow = niter)
+
+bgrid = expand.grid(1:J,1:P)
+cgrid = expand.grid(1:J,1:J,1); cgrid =cgrid |> filter(Var1 !=Var2);
+
+# having the names in teh correct order is useful for debugging code and sorting output
+theta_labels = c(#a
+               paste0("A",1:J),
+               #"b1lag1",...,"b1lagP",...,"bJlag1",..., "bJlagP"
+               sort(apply(bgrid,1,function(x){paste0("B",x[1],"lag",x[2])})),
+               #c
+                sort(apply(cgrid,1,function(x){paste0("C",x[1],"Xc",x[2],"lag",x[3])}))
+                 )
+sigma2 = rep(NA, niter)
+
+DTP_missing = matrix(NA, ncol = sum(missing_index), nrow = niter)
+
+log_posterior = rep(NA,niter) # track the log posterior at the end of passing through variables
+```
+
+Set up some starting values for the algorithms:
+
+
+```{r initialvalues}
+#| code-fold: true
+
+theta[1,] = rnorm((Number_of_a+Number_of_b+Number_of_c))
+sigma2[1] = 1
+colnames(theta) = theta_labels
+
+
+```
+
+
+
+## Sample (Infill) Missing Values
+
+Given the set of parameters (including proposed parameters) build a **model\_propagate** function to move the model ahead in time.
+
+
+
+```{r model_propagate}
+#| code-fold: true
+
+model_propagate = function(theta,sigma2,data,P = 1){
+  
+  # if missing values are in too early then the format passed in may not be a matrix
+  if(!is.matrix(data)){
+    data = matrix(data, ncol = length(data))
+  }
+# P = lag depth
+# predict the model ahead by one time increment
+#$$DTP_{ijt} = a_j + \sum_pb_{jp} * DTP_{ijt-p} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * DTP_{ikt-1}   + d * X_{i,j,t}  + e_{i,j,t}#
+  J     = ncol(data) #Ncountries
+  error = rnorm(J,mean = 0,sqrt(sigma2))
+  Number_of_a = J
+  Number_of_b = J*P
+  Number_of_c = (J-1)*J# We don't go into lags larger than 1 for the other countries
+  a     = theta[1:Number_of_a] |> matrix(nrow = Number_of_a)
+  # cols of B are lag.  Rows of b are country
+  b     = theta[(Number_of_a+1): (Number_of_a+Number_of_b)] |> matrix(nrow = Number_of_a, byrow = TRUE)
+  
+  ctemp = theta[(Number_of_a+Number_of_b+1):(Number_of_a+Number_of_b+Number_of_c)]|> matrix(nrow = Number_of_a, byrow = TRUE) 
+  # for the sake of matrix multiplication further down, make this a square with diagonal zeros.
+  cmat = matrix(NA, ncol = J, nrow = J)
+  # Fill upper triangle from  (excluding diagonal)
+  cmat[upper.tri(cmat)] = ctemp[upper.tri(ctemp, diag = TRUE)]
+  
+  # Fill lower triangle from M (excluding diagonal)
+  cmat[lower.tri(cmat)] = ctemp[lower.tri(ctemp, diag = FALSE)]
+  
+  # Fill diagonal with D
+  diag(cmat) = 0
+  
+  
+  
+  #$$DTP_{ijt} = a_j + \sum_pb_{jp} * DTP_{ijt-p} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * DTP_{ikt-1}   + d * X_{i,j,t}  + e_{i,j,t}#
+  # so that we take in the most recently evaluated data and put the lagged version in the right place
+  data_index = nrow(data):(nrow(data)-(P-1))
+  predicted_mean = a + 
+    apply(b*(data[data_index,]),1,sum) +
+    cmat%*%data[nrow(data),]
+  return(list(predicted_mean = predicted_mean,
+              error = error,
+              prediction = predicted_mean+error))
+}
+
+```
+
+Now sample the missing value of country $j$ at time $t$, $DTP_{jt}^*$, given the model, observed data, parameters, other countries, and previously infilled observations,
+
+$$DTP_{jt}^*\sim f\left(DTP_{j,t-1},..., DTP_{j,1},DTP_{(-j),t}, a,b,c,\sigma^2\right),$$
+using equation (\ref{eq:dtpijt}) and the function **infill\_missing**
+
+```{r infill_missing}
+#| code-fold: true
+infill_missing = function(theta,sigma2,data,P = 1){
+  
+  # pore-allocate and find the missing values
+  data_full = data
+  missing_index_time = is.na(data) |> apply(1,any) |> which()
+  
+  # Using the past, predict one step ahead to infill the present. 
+  for(time_point in missing_index_time){
+    country_missing = which(is.na(data_full[time_point,]))
+    
+      data_full[time_point,country_missing] = model_propagate(theta,sigma2,data_full[1:(time_point-1),],P = 1)$prediction[country_missing]
+
+    }
+  return(data_full)
+}
+
+
+```
+
+
+## Make Fake Data part 2
+
+Now we can actually propagate the model forward and create a fake dataset:
+
+```{r make_fake_data}
+#| code-fold: show
+
+
+data = infill_missing(theta_true,sigma2_true,data,P = 1)
+data[missing_index] = NA
+
+```
+## Log likelihood and log posterior
+
+Given the (full) data and the model parameters, we calculate the dataset by starting with initial states, then at each time increment we propagate the model ahead and use the propagation mean and variance as a data likelihood.  Sum the log likelihood contributions over \{country, time\} .
+The log likelihood is calcualted conditional on the parameters $\theta=[a,b,c]$, $\sigma^2$, and the nuissance parameter missing values $DTP_{jt}^*$.
+
+```{r loglikelihood}
+#| code-fold: true
+#| 
+# Log likelihood is calculated for the observed data conditional on the infilled missing data.
+loglikelihood = function(theta,sigma2,data_full,P = 1, missing_index){
+  time = nrow(data_full)
+  loglik = 0
+  for(time_index in (P+1):time){
+    prop_model = model_propagate(theta,sigma2,data_full[(1:time_index),],P = 1)
+    loglik = loglik + sum(
+                       dnorm(mean = prop_model$prediction, 
+                                sd   = sqrt(sigma2), 
+                                data_full[time_index,], 
+                                log  = TRUE)[!missing_index[time_index,]] # exclude missing values in the likelihood calculation since those are handled elsewhere.
+                        )
+    
+  }
+  return(loglik)
+}
+
+```
+
+
+Calculate the log posterior of the data conditional on the parameters.
+
+
+
+```{r logpost}
+#| code-fold: true
+#| 
+logpost = function(theta,sigma2,data,P = 1, missing_index,DTP0=NULL){
+  
+  sum(loglikelihood(theta,sigma2,data,P = 1, missing_index)) + logprior(theta,sigma2,DTP0)
+}
+
+```
+
+
+Based on the data generating model, the likelihood is the collection of normals centered on the propagate ahead mean with variance $\sigma^2$.
+
+
+
+
+## The Metropolis within Gibbs sampling routine
+
+
+
+
+1. (a) MH Any $DTP_0$ if using. Skip for now.  (b) Use the model to sample the missing values.
+2. MH A
+3. MH B
+4. MH C
+5. MH $\sigma^2$.  Though probably later deal with this using a more efficient, direct approach.
+
+
+
+
+```{r MCMC}
+#| code-fold: true
+#| cache: true
+
+J      = ncol(data) #Ncountries
+P      = 1 # max lag
+Number_of_a = J
+Number_of_b = J*P
+Number_of_c = (J-1)*J 
+
+A_index = theta_labels |> grep(pattern = "^A")
+B_index = theta_labels |> grep(pattern = "^B")
+C_index = theta_labels |> grep(pattern = "^C")
+
+current_stop = 1
+filename = "interim_results_MH_bigger.Rdata"
+
+T1 = Sys.time()
+for(iter in 1:(niter-1)){
+# iter = 1
+  theta_use = theta[iter,]
+  sigma2_use = sigma2[iter]
+  data_full          = infill_missing(theta = theta_use,sigma2 = sigma2_use,data=data,P = P)
+  DTP_missing[iter,] = data_full[missing_index]
+
+  ##### A #####
+  # propose a value from an easy distribution
+  Aprop               = rnorm(n = Number_of_a, mean = theta_use[A_index], sd = step_var[1]);
+  theta_prop          = theta_use
+  theta_prop[A_index] = Aprop
+  # the ratio of un-normalized posteriors.  Note that my proposal
+  # distribution is symmetric so Q_{ij}=Q_{ji}
+  log_post_prop = logpost(theta = theta_prop, sigma2 = sigma2_use, data = data_full, P = P,  missing_index,DTP0=NULL)  # proposed
+  log_post_old  = logpost(theta = theta_use,  sigma2 = sigma2_use, data = data_full, P = P,  missing_index,DTP0=NULL) # last accepted
+  logalpha =   log_post_prop - log_post_old
+  
+  if(!is.na(logalpha) && runif(1) < exp(logalpha)){
+    accepts[current_stop,1] = accepts[current_stop,1]+1;
+    theta_use = theta_prop
+    log_post_old  = log_post_prop
+  
+  }
+  ##### B #####
+  # propose a value from an easy distribution
+  Bprop               = rnorm(n = Number_of_b, mean = theta_use[B_index], sd = step_var[2]);
+  theta_prop          = theta_use
+  theta_prop[B_index] = Bprop
+  # the ratio of un-normalized posteriors.  Note that my proposal
+  # distribution is symmetric so Q_{ij}=Q_{ji}
+  log_post_prop = logpost(theta = theta_prop, sigma2 = sigma2_use, data = data_full, P = P,  missing_index,DTP0=NULL)  # proposed
+  logalpha =   log_post_prop - log_post_old
+  
+  if(!is.na(logalpha) && runif(1) < exp(logalpha)){
+    accepts[current_stop,2] = accepts[current_stop,2]+1;
+    theta_use = theta_prop
+    log_post_old  = log_post_prop
+  }
+  ##### C #####
+  # propose a value from an easy distribution
+  Cprop               = rnorm(n = Number_of_c, mean = theta_use[C_index], sd = step_var[3]);
+  theta_prop          = theta_use
+  theta_prop[C_index] = Cprop
+  # the ratio of un-normalized posteriors.  Note that my proposal
+  # distribution is symmetric so Q_{ij}=Q_{ji}
+  log_post_prop = logpost(theta = theta_prop, sigma2 = sigma2_use, data = data_full, P = P,  missing_index,DTP0=NULL)  # proposed
+  logalpha =   log_post_prop - log_post_old
+
+  
+  
+  
+  if(!is.na(logalpha) && runif(1) < exp(logalpha)){
+    accepts[current_stop,3] = accepts[current_stop,3]+1;
+    theta_use = theta_prop
+    log_post_old  = log_post_prop
+  }
+  
+  
+  #### Done those Gibbs {A,B,C} steps, lock in the resulting theta vector ####
+  theta[iter+1,] = theta_use
+  
+  
+  #### Sample from sigma^2 | everything else
+  #
+  # This can probably be done directly from the conditional distribution, 
+  # This is not wrong, but maybe innefficient
+  #
+  ##### sigma2 #####
+   # propose a value from an easy distribution: truncated Normal.  
+        sigma2_prop          = rtruncnorm(n = 1, a=0, b=Inf, mean = sigma2_use, sd = step_var[4])
+        # the ratio of un-normalized posteriors.  Note that my proposal
+        # distribution is symmetric so Q_{ij}=Q_{ji}
+        log_post_prop = logpost(theta = theta_use, 
+                                sigma = sigma2_prop, data = data_full, 
+                                P = P,  missing_index,
+                                DTP0=NULL)  # proposed
+        logalpha =   log_post_prop - 
+                      log_post_old + 
+                      log(dtruncnorm(sigma2_use,  a=0, b=Inf, mean = sigma2_prop, sd = step_var[4])) -
+                      log(dtruncnorm(sigma2_prop, a=0, b=Inf, mean = sigma2_use,  sd = step_var[4]))
+  
+  if(!is.na(logalpha) && runif(1) < exp(logalpha)){
+    accepts[current_stop,4] = accepts[current_stop,4]+1;
+    sigma2[iter+1] = sigma2_prop
+    log_post_old  = log_post_prop
+  }else{
+    sigma2[iter+1] = sigma2[iter]
+  }
+  log_posterior[iter+1] = log_post_old
+  
+  
+  if(iter==floor(current_stop*niter/nstops)){  
+    # calculate the acceptance rate.  Note that I use 1+ accepts / 2+ iterations.
+    # If I don't that and we don't accept any proposals the MCMC will crash and fail.
+    rate[current_stop,]= (1+accepts[current_stop,])/(2+niter/nstops);
+    cat(paste("iter = ",iter," Acceptance rate = ", paste(round(rate[current_stop,], 4), collapse = " , " ), "\n"))
+    current_stop = current_stop+1;
+    
+    save.image(filename) # optional, but helpful
+    
+    for(par_index in 1:(length(step_var)-1)){
+      if((rate[current_stop-1,par_index]>.28 ||  rate[current_stop-1,par_index]<.18)  && iter<= niter/2){
+        # do the adaptation but stop by the halfway point
+          step_var[par_index] = step_var[par_index]*rate[current_stop-1,par_index]/.23; 
+      }
+    }
+    # deal with sigma2 differently
+      if((rate[current_stop-1,4]>.49 ||  rate[current_stop-1,4]<.39)  && iter<= niter/2){
+        # do the adaptation but stop by the halfway point
+       step_var[par_index] = step_var[par_index]*rate[current_stop-1,4]/.44; 
+    }
+  }
+}
+
+
+elapsed = Sys.time() - T1 
+
+cat(paste("total compute time: ", round(as.numeric(elapsed, units = "secs"),2)," seconds"))
+save.image(filename)
+```
+
+
+## Make some plots:
+
+As always, discard the part of the MCMC where I was adapting the chains:
+
+
+```{r}
+
+#Check sampling:
+par(mfrow=c(3,3))
+plot(sigma2, type = 'l', main = "full samples sigma2")
+matplot(theta, type = 'l', main = "full samples thetas")
+matplot(DTP_missing, type = 'l', main = "full samples missing values")
+
+
+plot(sigma2[(niter/2):niter], type = 'l', main = "post burn in samples sigma2")
+matplot(theta[(niter/2):niter,], type = 'l', main = "post burn in samples thetas")
+matplot(DTP_missing[(niter/2):niter,], type = 'l', main = "post burn in samples missing values")
+
+
+# If using simulated data then consider the plots of parameters with their True values
+plot(density(sigma2[(niter/2):niter]), main = "variance term")
+boxplot(theta[(niter/2):niter,], main = "model parameters", las = 3)
+
+points(theta_true,pch = 2, col = "red", lwd = 5)
+boxplot(DTP_missing[(niter/2):niter,], main = "missing values")
+
+
+
+
+
+# theta
+theta |> 
+  as_tibble()|> 
+  pivot_longer(everything(),names_to = "par", values_to = "val") |>
+  ggplot()+
+  geom_density(aes(x = val ))+
+  facet_wrap(~par) + ggtitle("thetas")
+
+
+
+
+```
+
+
+## Running this on real data:
+
+- Real data will probably work using this code.  If values go beyond [0,1] then a transformation will need to be performed or the model adapted.
+- A real value for **niter** will be something more like 10,000 but more is better.  Expect the code to take a while.  Yes my code could be made more efficient, but piloting code with a small number of iterations, then just letting it run overnight is a very appropriate solution.
+- Another reasonable solution is to push the log posterior into an optimizer and extract the max and the second derivative of the log posterior with respect to the parameters.  Use the inverse second deriv as the starting point for the transition variance (**step\_var**).  That way it handles the correlation structure.  When I do that, I typically scale back the correlation somewhat before using.  You'll also need to replace the **rnorm** with a multivariate Gaussian sampler.
+- Use the script to extract the R code, because this will take a while to run. Note that the script will need to be adjusted because this quarto file generates some fake data.
+
+```{r purl}
+#| eval: false
+
+knitr::purl("modelling.qmd")
+
+```
+
+
+<!-- ## Probably junk here down -->
+
+
+<!-- ### Sampling missing observations -->
+
+<!-- Given the coefficients and observed data we can propagate the model forward -->
+
+<!-- Given the full set of observations we can evaluate the likelihood based on comparing the observed trajectory to the model -->
+
+<!-- ```{r} -->
+<!-- #| code-fold: true -->
+<!-- loglike = function(theta,sigma2,DTP0,data){ -->
+<!--   # $$DTP_{ijt} = a + b * DTP_{ijt-1} + c * DTP_{i(-j)t-1}   + d * X_{i,j,t}  + e_{i,j,t}, \ \ \ where\ \ \ e\sim N(0,\sigma^2_{i}).$$ -->
+
+
+<!--   for(country in 1:ncol(data)){ -->
+<!--       ### FIX TO HANDLE OTHER COUNTRIES by making c longer and country specific -->
+<!--     data_predict[country] = theta$a + theta$b*data_in_use[country] + theta$c * data_in_use[-country] #d * X_{i,j,t} -->
+<!--     data_predict[country] = data_predict[country] + rnorm(1,mean = 0, sd = sqrt(sigma2)) -->
+
+
+<!-- } -->
+
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- ## Sample missing values based on the sequential procedure -->
+
+<!-- #if initial value is missing: -->
+<!-- sample_DTP0 =  -->
+
+<!-- predict_ahead_one_step = function(theta,sigma2, data){ -->
+<!--   # start from the last time step: -->
+<!--   data_predict = data_in_use = data  -->
+<!--   # $$DTP_{ijt} = a + b * DTP_{ijt-1} + c * DTP_{i(-j)t-1}   + d * X_{i,j,t}  + e_{i,j,t}, \ \ \ where\ \ \ e\sim N(0,\sigma^2_{i}).$$ -->
+<!--     data_predict[country,] = theta$a + theta$b*data_in_use[country] + theta$c * data_in_use[-country] #d * X_{i,j,t} -->
+<!--     data_predict[country] = data_predict[country] + rnorm(1,mean = 0, sd = sqrt(sigma2)) -->
+<!-- } -->
+
+
+<!-- Data_impute = function(theta,sigma2, data, missing_index){ -->
+<!--   time_when_missing = which(apply(missing_index, 1, function(x){any(x)})) -->
+<!--   for(time in time_when_missing){ -->
+<!--     # predict ahead in time using the model -->
+
+
+<!--     } -->
+<!--   } -->
+
+
+<!-- } -->
+<!-- ``` -->
