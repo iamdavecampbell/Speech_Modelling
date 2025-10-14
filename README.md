@@ -24,4 +24,16 @@ Dropping the reliance on the topic index _i_, the model transitions ahead based 
 $$X_{jt} = a_j+b_{j} * X_{jt-1} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * X_{kt-1}+ \delta_{jt}.$$
 
 - MCMC_SS_functions.R = functions for performing MCMC on a state space model.  
-- Data_PTModelling_state_space.qmd = runs MCMC on data
+- Data_PTModelling_state_space.qmd = runs MCMC on data, still not very efficient
+- DATA_stan_state_space_model.qmd = recoded into STAN.  This is more efficient but still kinda slow.
+
+
+
+## Generalized Additive Model
+
+Looks forward and backward, so it is not quite like a time series.  The model set here is not as well fleshed out, but it works and is fast.
+
+- DATA_GAM_beta.qmd
+
+
+
