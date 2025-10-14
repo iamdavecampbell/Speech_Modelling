@@ -7,10 +7,21 @@ format:
     eval: true
 ---
 
+<!-- Waiting on a rerun for inflation (broken) and cbdc(didn't converge) -->
 
 ## Assessment
 
-State Space models are much better in that they seem to catch some of the dynamics.  This is still running so these results should be considered preliminary.   Mostly the sampling of the system states was not efficiently implemented.  Results to be updated.
+State Space models are much better in that they seem to catch some of the dynamics.  The sampling is notoriously challenging becuase we need to deal with latent states and relationships between states and parameters produce a complex posterior topography making good proposal distributions difficult.  **The results here are considered as demonstration only since the samples do not pass the quality control standards**.  I don't see this as being fixable other than running this for a really long time.
+
+
+One alternative is to use a sampler that handles the complex posterior shape directly.  Typically this involves recoding the model into **stan** and using Hamiltonian Monte Carlo or a (related) No U-Turn sampler.
+
+#### Other things to try
+
+- Sequential monte carlo which gets around the complex posterior by sequentially adding one time point at each stage, then filtering and repopulating samples.
+- Sequentially constrained Monte Carlo.  Similar to SMC, but rather than adding one data point at each stage, use the full dataset at each stage, but slowly bring in the model as a constraint.
+- Approximately marginalizing over the latent states using a Laplace Approximation.  The fastest is to use the very frequentist **TMB** software as an optimizer since it all runs in c++.  Slower is to use an Integrated Nested Laplace Approximation (INLA) which facilitates a Bayesian approach focused on the marginal posterior. 
+
 
 ## Basics
 
@@ -121,7 +132,7 @@ datafile   = paste0(datafolder,"nmf-time-series-g20.csv")
 
 #2. topic of interest
 candidate_topics = c("inflat" ,"brexit", "covid", "cbdc", "ukrain" )
-(topic_of_interest = candidate_topics[4])
+topic_of_interest = candidate_topics[4]
 
 #3 countries to use.  
 # possible option
@@ -149,7 +160,7 @@ if(topic_of_interest=="ukrain"){
 }
 
 #5  prefix for naming output filenames
-prefix = "raw" 
+prefix = "raw_slow_50k_" 
 
 ```
 
@@ -198,8 +209,7 @@ Set up the iterations, transition variances and frequency of tuning thereof, tem
 ```{r preamble}
 #| code-fold: true
 
-if(!exists("niter")){ niter = 50000 }    # total number of iterations
-print(niter)
+niter = 50000     # total number of iterations
 if(!exists("nstops")){nstops = 500  }   # number of times to assess the acceptance rate 
 print(nstops)
 step_var = .01      # starting transition variances for {pa,X,A,B,C,sigma2_delta,sigma2_e, Xother}
@@ -216,7 +226,7 @@ Run the MCMC.
 #| eval: false
 
 
-filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),"_",niter,".Rdata")
+filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
 print(filename)
 
 P = 1 # max lag
@@ -229,13 +239,14 @@ PT_results = Run_PT_SS(niter,  #MCMC iterations
                   data, # raw data with potential missing values
                   P, # max lag
                   nstops,
-                  Goal_acceptance_rate = c(pa = .44,
-                                           X = .23,
-                                           A = .23,
+                  Goal_acceptance_rate = c(A = .23,
                                            B = .23,
                                            C = .23,
                                            sigma2_delta = .44,
-                                           sigma2_e = .44), # target sampling acceptance rates
+                                           sigma2_e     = .44,
+                                           pa           = .44,
+                                           X            = .23,
+                                           Xstar        = .23), # target sampling acceptance rates
                   filename = filename,
                   step_var = 0.1,# initial guess at transition variance can be user specified.
                   CCor = diag(1, ncol(data)*(ncol(data)-1)) # potential correlation structure for C if known 
@@ -260,176 +271,176 @@ In all cases discard the part of the MCMC where chains were being adapted.
 
 ::: panel-tabset
 
-```{r}
-#| echo: false
+<!-- ```{r} -->
+<!-- #| echo: false -->
 
-topic_of_interest = candidate_topics[1]
-filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
-# filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),"_",niter,".Rdata")
-```
+<!-- topic_of_interest = candidate_topics[1] -->
+<!-- filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata") -->
 
-## Topic `r topic_of_interest`
+<!-- ``` -->
 
-Results loop over the topics of interest and rely on having run the above code set across different topics.
+<!-- ## Topic `r topic_of_interest` -->
 
-```{r top1load}
-#| code-fold: true
+<!-- Results loop over the topics of interest and rely on having run the above code set across different topics. -->
 
-load(filename)
-print(filename)
-```
+<!-- ```{r top1load} -->
+<!-- #| code-fold: true -->
 
-
-```{r top1index}
-#| code-fold: true
-#| output: asis
-
-niter = PT_results$theta[[1]]|> nrow()
-A_index        = PT_results$theta_labels |> grep(pattern = "^A")
-B_index        = PT_results$theta_labels |> grep(pattern = "^B")
-C_index        = PT_results$theta_labels |> grep(pattern = "^C")
-sigma2_delta_index    = PT_results$theta_labels |> grep(pattern = "sigma2_delta")
-sigma2_e_index = PT_results$theta_labels |> grep(pattern = "sigma2_e")
-pa_index       = PT_results$theta_labels |> grep(pattern = "^pa")
-X0_index       = PT_results$theta_labels |> grep(pattern = "^X0")
-  
-  
-Nsam = 1000
-
-NChain = length(temperatures)
-datafull = rep(list(matrix(NA, nrow = Nsam, ncol = ncol(PT_results$Xmat[[1]])/length(A_index))), ncol(data))
-logpost_samp = NA
-inds_keep = sample(floor(niter/2):niter, size = Nsam)
-
-for(sample_use in 1:Nsam){
-  prop_model = matrix(PT_results$Xmat[[5]][inds_keep[sample_use],], ncol = length(countries2use))
-  for(variable in 1:ncol(data)){
-      datafull[[variable]][sample_use, ] = prop_model[,variable]
-    }
-}
+<!-- load(filename) -->
+<!-- print(filename) -->
+<!-- ``` -->
 
 
-for(country in 1:length(countries2use)){
-matplot(x = dates_in_use,
-  t(datafull[[country]]), 
-        type = 'l',  
-        main = paste("posterior predictive fit for country",
-                                                          colnames(data)[country]),
-  ylim = c(-.1,.5))
-points(x = dates_in_use,
-       data[,country], 
-       pch = "*", cex = 3, col= "red")
-}
+<!-- ```{r top1index} -->
+<!-- #| code-fold: true -->
+<!-- #| output: asis -->
 
-```
-
+<!-- niter = PT_results$theta[[1]]|> nrow() -->
+<!-- A_index        = PT_results$theta_labels |> grep(pattern = "^A") -->
+<!-- B_index        = PT_results$theta_labels |> grep(pattern = "^B") -->
+<!-- C_index        = PT_results$theta_labels |> grep(pattern = "^C") -->
+<!-- sigma2_delta_index    = PT_results$theta_labels |> grep(pattern = "sigma2_delta") -->
+<!-- sigma2_e_index = PT_results$theta_labels |> grep(pattern = "sigma2_e") -->
+<!-- pa_index       = PT_results$theta_labels |> grep(pattern = "^pa") -->
+<!-- X0_index       = PT_results$theta_labels |> grep(pattern = "^X0") -->
 
 
-If a topic is non-stationary over this time duration then time series will aim for the wilder behaviour and consider it typical over the calmer time frame. Time series will really just be honest about uncertainty with the goal of making predictions at the expense of modelling inference.
+<!-- Nsam = 1000 -->
+
+<!-- NChain = length(temperatures) -->
+<!-- datafull = rep(list(matrix(NA, nrow = Nsam, ncol = ncol(PT_results$Xmat[[1]])/length(A_index))), ncol(data)) -->
+<!-- logpost_samp = NA -->
+<!-- inds_keep = sample(floor(niter/2):niter, size = Nsam) -->
+
+<!-- for(sample_use in 1:Nsam){ -->
+<!--   prop_model = matrix(PT_results$Xmat[[5]][inds_keep[sample_use],], ncol = length(countries2use)) -->
+<!--   for(variable in 1:ncol(data)){ -->
+<!--       datafull[[variable]][sample_use, ] = prop_model[,variable] -->
+<!--     } -->
+<!-- } -->
+
+
+<!-- for(country in 1:length(countries2use)){ -->
+<!-- matplot(x = dates_in_use, -->
+<!--   t(datafull[[country]]),  -->
+<!--         type = 'l',   -->
+<!--         main = paste("posterior predictive fit for country", -->
+<!--                                                           colnames(data)[country]), -->
+<!--   ylim = c(-.1,.5)) -->
+  <!-- points(x = dates_in_use[data[,country]!=0], -->
+  <!--        data[data[,country]!=0,country],  -->
+  <!--        pch = "*", cex = 3, col= "red") -->
+<!-- } -->
+
+<!-- ``` -->
 
 
 
-```{r top1logpost}
-#| code-fold: true
-#| output: asis
-
-#Check sampling:
-
-# logposterior
-LP = data.frame(logpost = unlist(PT_results$log_posterior),
-   temp = as.character(rep(temperatures, each = niter)),
-        index = rep(1:niter,  length(temperatures)))|> filter(index>floor(niter/50))
-LP|>
-  filter(index  %% 5 ==0) |>
-  ggplot()+
-  geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
-  ggtitle("Log unnormalized posterior")
-
-
-```
+<!-- If a topic is non-stationary over this time duration then time series will aim for the wilder behaviour and consider it typical over the calmer time frame. Time series will really just be honest about uncertainty with the goal of making predictions at the expense of modelling inference. -->
 
 
 
-```{r}
-#| code-fold: true
-#| output: asis
+<!-- ```{r top1logpost} -->
+<!-- #| code-fold: true -->
+<!-- #| output: asis -->
 
-# sigma2
+<!-- #Check sampling: -->
 
-print("sigma2_delta")
-PT_results$theta[[which(temperatures ==1)]][,"sigma2_delta"]|> summary()
-print("sigma2_e")
-PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
-
-
-LP = data.frame(
-        sigma2_delta = PT_results$theta[[5]][,"sigma2_delta"],
-        sigma2_e = PT_results$theta[[5]][,"sigma2_e"],
-        index = rep(1:niter,  length(temperatures)))|> 
-  filter(index>floor(niter/2)) |>
-  pivot_longer(cols = starts_with("sigma2"), names_to = "sigma2", values_to = "value")
-LP|>
-  ggplot()+
-  geom_density(aes(x = value, color = sigma2))+
-  facet_wrap(~sigma2, scales = "free")
+<!-- # logposterior -->
+<!-- LP = data.frame(logpost = unlist(PT_results$log_posterior), -->
+<!--    temp = as.character(rep(temperatures, each = niter)), -->
+<!--         index = rep(1:niter,  length(temperatures)))|> filter(index>floor(niter/50)) -->
+<!-- LP|> -->
+<!--   filter(index  %% 5 ==0) |> -->
+<!--   ggplot()+ -->
+<!--   geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+ -->
+<!--   ggtitle("Log unnormalized posterior")+geom_vline(xintercept = niter/2) -->
 
 
-```
-
-
-If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero. However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable.
-
-
-```{r top1theta}
-#| code-fold: true
-#| output: asis
-
-# theta
-LP =
-  lapply(PT_results$theta, function(x){x|> 
-      as_tibble()|>
-      pivot_longer(everything(),names_to = "par", values_to = "val")|>
-  mutate(index = rep(1:niter, each = ncol(x)))
-    })
-
-stacked = NULL
-for(chain in 1:length(temperatures)){
-  stacked = stacked |> 
-    bind_rows(LP[[chain]] |> 
-                mutate(temp = as.factor(temperatures[chain])))
-}
-stacked |> 
-  filter(index>floor(niter/2))|>
-  filter(str_detect(par, pattern = "^A" ))|>
-  filter(temp == "1")|>
-  ggplot()+
-  geom_density(aes(x = val ))+
-  geom_vline(xintercept = 0, linewidth = .5)+
-  facet_wrap(~par) + ggtitle("thetas, A")
-
-
-stacked |> 
-    filter(index>floor(niter/2))|>
-    filter(str_detect(par, pattern = "^B" ))|>
-  filter(temp == "1")|>
-    ggplot()+
-    geom_density(aes(x = val ))+
-    geom_vline(xintercept = 0, linewidth = .5)+
-    facet_wrap(~par) + ggtitle("thetas, B")
-
-
-stacked |> 
-    filter(index>floor(niter/2))|>
-    filter(str_detect(par, pattern = "^C" ))|>
-  filter(temp == "1")|>
-    ggplot()+
-    geom_density(aes(x = val))+
-    geom_vline(xintercept = 0)+ 
-  facet_wrap(~par) + ggtitle("thetas, C")
+<!-- ``` -->
 
 
 
-```
+<!-- ```{r} -->
+<!-- #| code-fold: true -->
+<!-- #| output: asis -->
+
+<!-- # sigma2 -->
+
+<!-- print("sigma2_delta") -->
+<!-- PT_results$theta[[which(temperatures ==1)]][1:(niter/2),"sigma2_delta"]|> summary() -->
+<!-- print("sigma2_e") -->
+<!-- PT_results$theta[[which(temperatures ==1)]][1:(niter/2),"sigma2_e"]|> summary() -->
+
+
+<!-- LP = data.frame( -->
+<!--         sigma2_delta = PT_results$theta[[5]][,"sigma2_delta"], -->
+<!--         sigma2_e = PT_results$theta[[5]][,"sigma2_e"], -->
+<!--         index = rep(1:niter,  length(temperatures)))|>  -->
+<!--   filter(index>floor(niter/2)) |> -->
+<!--   pivot_longer(cols = starts_with("sigma2"), names_to = "sigma2", values_to = "value") -->
+<!-- LP|> -->
+<!--   ggplot()+ -->
+<!--   geom_density(aes(x = value, color = sigma2))+ -->
+<!--   facet_wrap(~sigma2, scales = "free") -->
+
+
+<!-- ``` -->
+
+
+<!-- If there is a signal conducive to the way the model is set up then these posterior distributions should be away from zero. However, if a parameter is greater than zero it implies that the dataset is growing and is therefore not stable. -->
+
+
+<!-- ```{r top1theta} -->
+<!-- #| code-fold: true -->
+<!-- #| output: asis -->
+
+<!-- # theta -->
+<!-- LP = -->
+<!--   lapply(PT_results$theta, function(x){x|>  -->
+<!--       as_tibble()|> -->
+<!--       pivot_longer(everything(),names_to = "par", values_to = "val")|> -->
+<!--   mutate(index = rep(1:niter, each = ncol(x))) -->
+<!--     }) -->
+
+<!-- stacked = NULL -->
+<!-- for(chain in 1:length(temperatures)){ -->
+<!--   stacked = stacked |>  -->
+<!--     bind_rows(LP[[chain]] |>  -->
+<!--                 mutate(temp = as.factor(temperatures[chain]))) -->
+<!-- } -->
+<!-- stacked |>  -->
+<!--   filter(index>floor(niter/2))|> -->
+<!--   filter(str_detect(par, pattern = "^A" ))|> -->
+<!--   filter(temp == "1")|> -->
+<!--   ggplot()+ -->
+<!--   geom_density(aes(x = val ))+ -->
+<!--   geom_vline(xintercept = 0, linewidth = .5)+ -->
+<!--   facet_wrap(~par) + ggtitle("thetas, A") -->
+
+
+<!-- stacked |>  -->
+<!--     filter(index>floor(niter/2))|> -->
+<!--     filter(str_detect(par, pattern = "^B" ))|> -->
+<!--   filter(temp == "1")|> -->
+<!--     ggplot()+ -->
+<!--     geom_density(aes(x = val ))+ -->
+<!--     geom_vline(xintercept = 0, linewidth = .5)+ -->
+<!--     facet_wrap(~par) + ggtitle("thetas, B") -->
+
+
+<!-- stacked |>  -->
+<!--     filter(index>floor(niter/2))|> -->
+<!--     filter(str_detect(par, pattern = "^C" ))|> -->
+<!--   filter(temp == "1")|> -->
+<!--     ggplot()+ -->
+<!--     geom_density(aes(x = val))+ -->
+<!--     geom_vline(xintercept = 0)+  -->
+<!--   facet_wrap(~par) + ggtitle("thetas, C") -->
+
+
+
+<!-- ``` -->
 
 
 
@@ -489,8 +500,8 @@ matplot(x = dates_in_use,
         main = paste("posterior predictive fit for country",
                                                           colnames(data)[country]),
   ylim = c(-.1,.5))
-points(x = dates_in_use,
-       data[,country], 
+points(x = dates_in_use[data[,country]!=0],
+       data[data[,country]!=0,country], 
        pch = "*", cex = 3, col= "red")
 }
 
@@ -516,11 +527,10 @@ LP|>
   filter(index  %% 5 ==0) |>
   ggplot()+
   geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
-  ggtitle("Log unnormalized posterior")
+  ggtitle("Log unnormalized posterior")+geom_vline(xintercept = niter/2)
 
 
 ```
-
 
 
 ```{r}
@@ -530,9 +540,9 @@ LP|>
 # sigma2
 
 print("sigma2_delta")
-PT_results$theta[[which(temperatures ==1)]][,"sigma2_delta"]|> summary()
+PT_results$theta[[which(temperatures ==1)]][1:(niter/2),"sigma2_delta"]|> summary()
 print("sigma2_e")
-PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
+PT_results$theta[[which(temperatures ==1)]][1:(niter/2),"sigma2_e"]|> summary()
 
 
 LP = data.frame(
@@ -615,7 +625,7 @@ stacked |>
 
 topic_of_interest = candidate_topics[3]
 filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),".Rdata")
-# filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),"_",niter,".Rdata")
+
 ```
 
 ## Topic `r topic_of_interest`
@@ -666,9 +676,9 @@ matplot(x = dates_in_use,
         main = paste("posterior predictive fit for country",
                                                           colnames(data)[country]),
   ylim = c(-.1,.5))
-points(x = dates_in_use,
-       data[,country], 
-       pch = "*", cex = 3, col= "red")
+  points(x = dates_in_use[data[,country]!=0],
+         data[data[,country]!=0,country], 
+         pch = "*", cex = 3, col= "red")
 }
 
 ```
@@ -693,7 +703,7 @@ LP|>
   filter(index  %% 5 ==0) |>
   ggplot()+
   geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
-  ggtitle("Log unnormalized posterior")
+  ggtitle("Log unnormalized posterior")+geom_vline(xintercept = niter/2)
 
 
 ```
@@ -707,9 +717,9 @@ LP|>
 # sigma2
 
 print("sigma2_delta")
-PT_results$theta[[which(temperatures ==1)]][,"sigma2_delta"]|> summary()
+PT_results$theta[[which(temperatures ==1)]][1:(niter/2),"sigma2_delta"]|> summary()
 print("sigma2_e")
-PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
+PT_results$theta[[which(temperatures ==1)]][1:(niter/2),"sigma2_e"]|> summary()
 
 
 LP = data.frame(
@@ -723,7 +733,10 @@ LP|>
   geom_density(aes(x = value, color = sigma2))+
   facet_wrap(~sigma2, scales = "free")
 
-
+LP|>
+  ggplot()+
+  geom_line(aes(x = index, y=value, color = sigma2))+
+  facet_wrap(~sigma2, scales = "free")
 ```
 
 
@@ -748,6 +761,22 @@ for(chain in 1:length(temperatures)){
     bind_rows(LP[[chain]] |> 
                 mutate(temp = as.factor(temperatures[chain])))
 }
+for(country in 1:length(countries2use)){
+stacked = stacked|> mutate(
+  par = str_replace_all(par,
+                        pattern = paste0("A",country),
+                        replacement = paste0("A_",countries2use[country])))|> mutate(
+  par = str_replace_all(par,
+                        pattern = paste0("B",country),
+                        replacement = paste0("B_",countries2use[country])))|> mutate(
+  par = str_replace_all(par,
+                        pattern = paste0("C",country),
+                        replacement = paste0("C_",countries2use[country])))|> mutate(
+  par = str_replace_all(par,
+                        pattern = paste0("c",country),
+                        replacement = paste0("c_",countries2use[country])))
+}
+
 stacked |> 
   filter(index>floor(niter/2))|>
   filter(str_detect(par, pattern = "^A" ))|>
@@ -775,7 +804,8 @@ stacked |>
     ggplot()+
     geom_density(aes(x = val))+
     geom_vline(xintercept = 0)+ 
-  facet_wrap(~par) + ggtitle("thetas, C")
+  facet_wrap(~par, ncol = 6) + 
+  ggtitle("thetas, C")
 
 
 
@@ -849,9 +879,9 @@ matplot(x = dates_in_use,
         main = paste("posterior predictive fit for country",
                                                           colnames(data)[country]),
   ylim = c(-.1,.5))
-points(x = dates_in_use,
-       data[,country], 
-       pch = "*", cex = 3, col= "red")
+  points(x = dates_in_use[data[,country]!=0],
+         data[data[,country]!=0,country], 
+         pch = "*", cex = 3, col= "red")
 }
 
 ```
@@ -876,7 +906,7 @@ LP|>
   filter(index  %% 5 ==0) |>
   ggplot()+
   geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
-  ggtitle("Log unnormalized posterior")
+  ggtitle("Log unnormalized posterior")+geom_vline(xintercept = niter/2)
 
 
 ```
@@ -890,9 +920,9 @@ LP|>
 # sigma2
 
 print("sigma2_delta")
-PT_results$theta[[which(temperatures ==1)]][,"sigma2_delta"]|> summary()
+PT_results$theta[[which(temperatures ==1)]][1:(niter/2),"sigma2_delta"]|> summary()
 print("sigma2_e")
-PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
+PT_results$theta[[which(temperatures ==1)]][1:(niter/2),"sigma2_e"]|> summary()
 
 
 LP = data.frame(
@@ -1037,9 +1067,9 @@ matplot(x = dates_in_use,
         main = paste("posterior predictive fit for country",
                                                           colnames(data)[country]),
   ylim = c(-.1,.5))
-points(x = dates_in_use,
-       data[,country], 
-       pch = "*", cex = 3, col= "red")
+  points(x = dates_in_use[data[,country]!=0],
+         data[data[,country]!=0,country], 
+         pch = "*", cex = 3, col= "red")
 }
 
 ```
@@ -1064,7 +1094,7 @@ LP|>
   filter(index  %% 5 ==0) |>
   ggplot()+
   geom_line(aes(y = logpost, x = index, color = temp), alpha = 1)+
-  ggtitle("Log unnormalized posterior")
+  ggtitle("Log unnormalized posterior")+geom_vline(xintercept = niter/2)
 
 
 ```
@@ -1078,9 +1108,9 @@ LP|>
 # sigma2
 
 print("sigma2_delta")
-PT_results$theta[[which(temperatures ==1)]][,"sigma2_delta"]|> summary()
+PT_results$theta[[which(temperatures ==1)]][1:(niter/2),"sigma2_delta"]|> summary()
 print("sigma2_e")
-PT_results$theta[[which(temperatures ==1)]][,"sigma2_e"]|> summary()
+PT_results$theta[[which(temperatures ==1)]][1:(niter/2),"sigma2_e"]|> summary()
 
 
 LP = data.frame(
