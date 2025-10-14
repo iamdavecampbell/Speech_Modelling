@@ -1,0 +1,1533 @@
+---
+title: "Generalized Aditive Models for Text Topic Proportions"
+format: 
+  html:
+    html-math-method: mathjax
+    echo: true
+    eval: true
+---
+
+
+## Assessment
+
+
+Generalized Additive models are regression models that do not account for the chronology of the dynamics.  The idea is that there is an underlying smooth process and the observations are noisy realizations thereof.  
+
+## Basics
+
+```{r version}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(lubridate)
+library(mgcv)
+# import main functions
+source("MCMC_SS_functions.R")     # Main Metropolis Hasting for vectorized state space model - just used for dataload and setup
+version
+```
+
+## All-in-one Beta Regression for Topic Proportions:
+
+
+For country **j** at time **t** we model the document term proportion ($DTP_{jt}$).
+$$DTP_{jt} \sim Beta(\mu,\phi)$$
+
+In a deviation from convention, the Beta($\mu,\phi$) is parameterized such that it has mean $\mu$ and variance $\mu(1-\mu)/(1+\phi)$ for precision $\phi$.   The parameters are modelled by country effects ($a_j$) and a time effect ($b_j$) through a link function (here $logit$):
+
+$$logit(\mu) = a_j+b_{j} *t,$$
+and $\phi$ is estimated from the model. This is an _all-in-one_ model as it does not show interdependence between countries.  By modeling $DTP_{jt}$ directly we expect different countries to have different effects, if two countries have the same effect, the model says that we they behave similary.  However it doesn't say anything about strength and direction of relationship unless we model it in directly.  One way to do that is to set up the $a_j$ to have a baseline of interest or define the regression coefficients to hold contracts.  
+
+
+## Country Relationships using Beta Regression
+
+To model how one country might impact another we would need a fancier regression strategy. Although Structural Equation Modelling is probably the right approach, a simpler model is useful for assesing if there is enough signal in the data to  try something more extensive.  Here we suggest running $J$ models, one for each country:
+
+$$DTP_{jt} \sim Beta(\mu_j,\phi_j), \ \ where\ \ logit(\mu_j) = a_j+b_{j}*t+\sum_{k\in \{1,...,J-1\}/j}c_kDTP_{kt}. $$
+
+
+## Generalized Additive Regression
+
+
+A probably more appropriate model is to replace the linear relationship with a more flexible smooth relationship using smoothing splines.  If such a model captures enough of the signal then the residuals will be uncorrelated and we can safely ignore the time series toolkit.  
+
+Expanding on the one model per country approach the result is given below where $s(\cdot)$ denotes a 'spline smooth' term rather than a linear term,
+
+$$DTP_{jt} \sim Beta(\mu_j,\phi_j), \ \ where\ \ logit(\mu_j) = s_j(t)+\sum_{k\in \{1,...,J-1\}/j}s_k(DTP_{kt}). $$
+
+
+
+The country specific time effect $s_j(t)$ deals with the overall time trend. The effect of other countries $s_k(DTP_{kt})$ allows country $k$ to impact country $j$ differently at different levels.  
+
+Beta regression has the advantaget that it can be quickly estimated using maximum likelihood regression.
+
+
+
+
+## User Defined Options
+
+Note that there are some switches that a user may define here.  In this code block the user defines:
+
+1. the location and file containing the time series of topics.
+2. the topic of interest
+3. the countries to use
+4. The first month to use.
+5. deciding if the log or raw data should be used.
+
+```{r user_defined_options}
+# 1. location and filename
+datafolder = "cbspeeches-main/inst/data-misc/"
+datafile   = paste0(datafolder,"nmf-time-series-g20.csv")
+
+#2. topics of interest
+candidate_topics = c("inflat" ,"brexit", "covid", "cbdc", "ukrain" )
+
+#3 countries to use.  
+# possible option
+G7_countries = c ("Canada", "France", "Germany", "Italy", "Japan",  "United Kingdom","United States")
+# possible option
+CUSA = c ("Canada","United States")
+# actual decision:
+countries2use = G7_countries# unique(dataset$country)
+
+#4 first month to use, 
+# start of dataset based on their first mention in the dataset.
+start_date = NULL
+start_date["inflat"] = ymd("2008-11-01")
+start_date["brexit"] = ymd("2016-02-01")
+start_date["covid"]  = ymd("2020-01-01")
+start_date["cbdc"]   = ymd("2016-02-01")
+start_date["ukrain"] = ymd("2014-03-01")
+
+#5  prefix for naming output filenames
+prefix = "raw" 
+
+```
+
+
+
+## Caution.
+
+Using beta regression the likelihood will run into problems is we have zeros.  The likelihood estimates become unstable since the best parameter coefficients are basically $\pm \infty$.  There are two solutions.  
+
+1. Assume that zeros are just non-observations, so discard them.
+2. Assume that zeros matter, and instead plug in a small value.
+3. Assume the zeros are important zeros
+
+While **1** discards information, **2** pretends that we have actual new information.  Both will have an impact where the difference will be largest where there are long (time) gaps of zero values.  In those cases **1** will smooth across them as though it has no information, whereas the fit to **2** will be pulled down towards the imputed value. Option **1** is the same as what was used in the state space model approach.  Strategy  **3** can be done using the actual zero values, but needs another tool, such as Bayesian regression model, see library **brms** in R.  This seems very doable.
+
+
+
+## Model fitting: All in one model, no external country influence
+
+Start with the GAM version of the all in one model allowing for an interaction between date and country but no relationships between countries.
+$$DTP_{jt} \sim Beta(\mu,\phi), \ \ \  where\ \ \ logit(\mu) = s_j(date)$$
+
+
+
+
+
+::: panel-tabset
+
+```{r}
+#| echo: false
+lp = 0
+```
+
+
+
+```{r}
+#| echo: false
+lp = lp+1
+topic_of_interest = candidate_topics[lp]
+```
+
+## Topic `r topic_of_interest`
+
+Data Loading
+
+
+```{r topic1}
+#| warning: false
+
+#. just loading and maybe transforming the data:
+data_full = dataload(datafile, topic_of_interest, countries2use, start_date[topic_of_interest])
+dates_in_use         = data_full$dates_in_use
+dates_in_use_decimal = decimal_date(dates_in_use)
+data = cbind(data_full$data,dates_in_use_decimal)
+```
+It's worthwhile getting a sense of how much information we actually have.  Count the non-zero entries per country:
+
+```{r}
+apply(data , 2, function(x){length(which(x>0 & !is.na(x)))})
+```
+
+And if we drop the rows with at least one NA we get:
+
+```{r}
+apply(drop_na(as_tibble(data)) , 2, function(x){length(which(x>0 & !is.na(x)))})
+```
+
+
+
+
+
+
+```{r }
+#| code-fold: true
+
+# First try imputing a value for zero.
+# the NMF was run with 40 topics, so a small value would be 0.01 / 40
+# implying that the observation is one hundredth the size of a uniform topic distribution at that time point.
+data_long_imputed = as_tibble(data) |> 
+          pivot_longer(cols = all_of(countries2use),
+                     names_to = "country", values_to = "Y")|>
+  mutate(country = factor(country)) |>
+  mutate(Y = ifelse(Y==0, .01/40, Y)) |> 
+  drop_na()
+
+data_long_remove = as_tibble(data) |> 
+          pivot_longer(cols = all_of(countries2use),
+                     names_to = "country", values_to = "Y")|>
+      mutate(country = factor(country)) |>
+      filter(Y>0 & ! is.na(Y))
+
+
+
+gam_all_in_one_impute = gam(Y~ s(dates_in_use_decimal, by = country),
+                                  family=betar(link="logit"),
+                                    data = data_long_imputed)
+
+gam_all_in_one_remove = gam(Y~ s(dates_in_use_decimal, by = country),
+                                  family=betar(link="logit"),
+                                    data = data_long_remove)
+```
+
+
+
+Check the residuals.   We should expect that the _impute_ strategy will have strange behaviour near the imputed values since those are all the same.
+
+
+```{r}
+summary(gam_all_in_one_impute)
+
+predictions <- predict(gam_all_in_one_impute, type = "response", se.fit = TRUE)
+your_data = data_long_imputed
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+data_long_remove
+ggplot(your_data, aes(x = dates_in_use_decimal, y = Y,color = country)) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  facet_wrap(~country)+
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for topic:", topic_of_interest),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_all_in_one_impute)
+```
+
+Qualitatively the fit should be pretty similar between the two methods, but the _impute_ strategy imposes scores of observations at a specified value.
+
+```{r}
+summary(gam_all_in_one_remove)
+
+predictions <- predict(gam_all_in_one_remove, type = "response", se.fit = TRUE)
+your_data = data_long_remove
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y = Y,color = country)) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  facet_wrap(~country)+
+  labs(title = paste("GAM model and CIs for mean DTP for topic:", topic_of_interest),
+       y = "DTP",
+       x = "remove 0 and NA")
+
+
+par(mfrow=c(2,2))
+gam.check(gam_all_in_one_remove)
+
+```
+
+
+
+
+
+```{r}
+#| echo: false
+countrynumber = 0 
+countries.2.use = countries2use|> gsub(pattern = "\\s",replacement =".")
+```
+
+
+
+
+
+
+```{r}
+#| echo: false
+lp = 0
+```
+
+
+
+```{r}
+#| echo: false
+lp = lp+1
+topic_of_interest = candidate_topics[lp]
+```
+
+## Topic `r topic_of_interest`
+
+Data Loading
+
+
+```{r topic2}
+#| warning: false
+
+#. just loading and maybe transforming the data:
+data_full = dataload(datafile, topic_of_interest, countries2use, start_date[topic_of_interest])
+dates_in_use         = data_full$dates_in_use
+dates_in_use_decimal = decimal_date(dates_in_use)
+data = cbind(data_full$data,dates_in_use_decimal)
+```
+It's worthwhile getting a sense of how much information we actually have.  Count the non-zero entries per country:
+
+```{r}
+apply(data , 2, function(x){length(which(x>0 & !is.na(x)))})
+```
+
+And if we drop the rows with at least one NA we get:
+
+```{r}
+apply(drop_na(as_tibble(data)) , 2, function(x){length(which(x>0 & !is.na(x)))})
+```
+
+
+
+
+
+
+```{r }
+#| code-fold: true
+
+# First try imputing a value for zero.
+# the NMF was run with 40 topics, so a small value would be 0.01 / 40
+# implying that the observation is one hundredth the size of a uniform topic distribution at that time point.
+data_long_imputed = as_tibble(data) |> 
+          pivot_longer(cols = all_of(countries2use),
+                     names_to = "country", values_to = "Y")|>
+  mutate(country = factor(country)) |>
+  mutate(Y = ifelse(Y==0, .01/40, Y)) |> 
+  drop_na()
+
+data_long_remove = as_tibble(data) |> 
+          pivot_longer(cols = all_of(countries2use),
+                     names_to = "country", values_to = "Y")|>
+      mutate(country = factor(country)) |>
+      filter(Y>0 & ! is.na(Y))
+
+
+
+gam_all_in_one_impute = gam(Y~ s(dates_in_use_decimal, by = country),
+                                  family=betar(link="logit"),
+                                    data = data_long_imputed)
+
+gam_all_in_one_remove = gam(Y~ s(dates_in_use_decimal, by = country),
+                                  family=betar(link="logit"),
+                                    data = data_long_remove)
+```
+
+
+
+Check the residuals.   We should expect that the _impute_ strategy will have strange behaviour near the imputed values since those are all the same.
+
+
+```{r}
+summary(gam_all_in_one_impute)
+
+predictions <- predict(gam_all_in_one_impute, type = "response", se.fit = TRUE)
+your_data = data_long_imputed
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+data_long_remove
+ggplot(your_data, aes(x = dates_in_use_decimal, y = Y,color = country)) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  facet_wrap(~country)+
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for topic:", topic_of_interest),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_all_in_one_impute)
+```
+
+Qualitatively the fit should be pretty similar between the two methods, but the _impute_ strategy imposes scores of observations at a specified value.
+
+```{r}
+summary(gam_all_in_one_remove)
+
+predictions <- predict(gam_all_in_one_remove, type = "response", se.fit = TRUE)
+your_data = data_long_remove
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y = Y,color = country)) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  facet_wrap(~country)+
+  labs(title = paste("GAM model and CIs for mean DTP for topic:", topic_of_interest),
+       y = "DTP",
+       x = "remove 0 and NA")
+
+
+par(mfrow=c(2,2))
+gam.check(gam_all_in_one_remove)
+
+```
+
+
+
+
+
+```{r}
+#| echo: false
+countrynumber = 0 
+countries.2.use = countries2use|> gsub(pattern = "\\s",replacement =".")
+```
+
+
+
+
+
+
+```{r}
+#| echo: false
+lp = 0
+```
+
+
+
+```{r}
+#| echo: false
+lp = lp+1
+topic_of_interest = candidate_topics[lp]
+```
+
+## Topic `r topic_of_interest`
+
+Data Loading
+
+
+```{r topic3}
+#| warning: false
+
+#. just loading and maybe transforming the data:
+data_full = dataload(datafile, topic_of_interest, countries2use, start_date[topic_of_interest])
+dates_in_use         = data_full$dates_in_use
+dates_in_use_decimal = decimal_date(dates_in_use)
+data = cbind(data_full$data,dates_in_use_decimal)
+```
+It's worthwhile getting a sense of how much information we actually have.  Count the non-zero entries per country:
+
+```{r}
+apply(data , 2, function(x){length(which(x>0 & !is.na(x)))})
+```
+
+And if we drop the rows with at least one NA we get:
+
+```{r}
+apply(drop_na(as_tibble(data)) , 2, function(x){length(which(x>0 & !is.na(x)))})
+```
+
+
+
+
+
+
+```{r }
+#| code-fold: true
+
+# First try imputing a value for zero.
+# the NMF was run with 40 topics, so a small value would be 0.01 / 40
+# implying that the observation is one hundredth the size of a uniform topic distribution at that time point.
+data_long_imputed = as_tibble(data) |> 
+          pivot_longer(cols = all_of(countries2use),
+                     names_to = "country", values_to = "Y")|>
+  mutate(country = factor(country)) |>
+  mutate(Y = ifelse(Y==0, .01/40, Y)) |> 
+  drop_na()
+
+data_long_remove = as_tibble(data) |> 
+          pivot_longer(cols = all_of(countries2use),
+                     names_to = "country", values_to = "Y")|>
+      mutate(country = factor(country)) |>
+      filter(Y>0 & ! is.na(Y))
+
+
+
+gam_all_in_one_impute = gam(Y~ s(dates_in_use_decimal, by = country),
+                                  family=betar(link="logit"),
+                                    data = data_long_imputed)
+
+gam_all_in_one_remove = gam(Y~ s(dates_in_use_decimal, by = country),
+                                  family=betar(link="logit"),
+                                    data = data_long_remove)
+```
+
+
+
+Check the residuals.   We should expect that the _impute_ strategy will have strange behaviour near the imputed values since those are all the same.
+
+
+```{r}
+summary(gam_all_in_one_impute)
+
+predictions <- predict(gam_all_in_one_impute, type = "response", se.fit = TRUE)
+your_data = data_long_imputed
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+data_long_remove
+ggplot(your_data, aes(x = dates_in_use_decimal, y = Y,color = country)) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  facet_wrap(~country)+
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for topic:", topic_of_interest),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_all_in_one_impute)
+```
+
+Qualitatively the fit should be pretty similar between the two methods, but the _impute_ strategy imposes scores of observations at a specified value.
+
+```{r}
+summary(gam_all_in_one_remove)
+
+predictions <- predict(gam_all_in_one_remove, type = "response", se.fit = TRUE)
+your_data = data_long_remove
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y = Y,color = country)) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  facet_wrap(~country)+
+  labs(title = paste("GAM model and CIs for mean DTP for topic:", topic_of_interest),
+       y = "DTP",
+       x = "remove 0 and NA")
+
+
+par(mfrow=c(2,2))
+gam.check(gam_all_in_one_remove)
+
+```
+
+
+
+
+
+```{r}
+#| echo: false
+countrynumber = 0 
+countries.2.use = countries2use|> gsub(pattern = "\\s",replacement =".")
+```
+
+
+
+
+
+```{r}
+#| echo: false
+lp = 0
+```
+
+
+
+```{r}
+#| echo: false
+lp = lp+1
+topic_of_interest = candidate_topics[lp]
+```
+
+## Topic `r topic_of_interest`
+
+Data Loading
+
+
+```{r topic4}
+#| warning: false
+
+#. just loading and maybe transforming the data:
+data_full = dataload(datafile, topic_of_interest, countries2use, start_date[topic_of_interest])
+dates_in_use         = data_full$dates_in_use
+dates_in_use_decimal = decimal_date(dates_in_use)
+data = cbind(data_full$data,dates_in_use_decimal)
+```
+It's worthwhile getting a sense of how much information we actually have.  Count the non-zero entries per country:
+
+```{r}
+apply(data , 2, function(x){length(which(x>0 & !is.na(x)))})
+```
+
+And if we drop the rows with at least one NA we get:
+
+```{r}
+apply(drop_na(as_tibble(data)) , 2, function(x){length(which(x>0 & !is.na(x)))})
+```
+
+
+
+
+
+
+```{r }
+#| code-fold: true
+
+# First try imputing a value for zero.
+# the NMF was run with 40 topics, so a small value would be 0.01 / 40
+# implying that the observation is one hundredth the size of a uniform topic distribution at that time point.
+data_long_imputed = as_tibble(data) |> 
+          pivot_longer(cols = all_of(countries2use),
+                     names_to = "country", values_to = "Y")|>
+  mutate(country = factor(country)) |>
+  mutate(Y = ifelse(Y==0, .01/40, Y)) |> 
+  drop_na()
+
+data_long_remove = as_tibble(data) |> 
+          pivot_longer(cols = all_of(countries2use),
+                     names_to = "country", values_to = "Y")|>
+      mutate(country = factor(country)) |>
+      filter(Y>0 & ! is.na(Y))
+
+
+
+gam_all_in_one_impute = gam(Y~ s(dates_in_use_decimal, by = country),
+                                  family=betar(link="logit"),
+                                    data = data_long_imputed)
+
+gam_all_in_one_remove = gam(Y~ s(dates_in_use_decimal, by = country),
+                                  family=betar(link="logit"),
+                                    data = data_long_remove)
+```
+
+
+
+Check the residuals.   We should expect that the _impute_ strategy will have strange behaviour near the imputed values since those are all the same.
+
+
+```{r}
+summary(gam_all_in_one_impute)
+
+predictions <- predict(gam_all_in_one_impute, type = "response", se.fit = TRUE)
+your_data = data_long_imputed
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+data_long_remove
+ggplot(your_data, aes(x = dates_in_use_decimal, y = Y,color = country)) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  facet_wrap(~country)+
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for topic:", topic_of_interest),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_all_in_one_impute)
+```
+
+Qualitatively the fit should be pretty similar between the two methods, but the _impute_ strategy imposes scores of observations at a specified value.
+
+```{r}
+summary(gam_all_in_one_remove)
+
+predictions <- predict(gam_all_in_one_remove, type = "response", se.fit = TRUE)
+your_data = data_long_remove
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y = Y,color = country)) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  facet_wrap(~country)+
+  labs(title = paste("GAM model and CIs for mean DTP for topic:", topic_of_interest),
+       y = "DTP",
+       x = "remove 0 and NA")
+
+
+par(mfrow=c(2,2))
+gam.check(gam_all_in_one_remove)
+
+```
+
+
+
+
+
+```{r}
+#| echo: false
+countrynumber = 0 
+countries.2.use = countries2use|> gsub(pattern = "\\s",replacement =".")
+```
+
+
+
+
+
+
+```{r}
+#| echo: false
+lp = 0
+```
+
+
+
+```{r}
+#| echo: false
+lp = lp+1
+topic_of_interest = candidate_topics[lp]
+```
+
+## Topic `r topic_of_interest`
+
+Data Loading
+
+
+```{r topic5}
+#| warning: false
+
+#. just loading and maybe transforming the data:
+data_full = dataload(datafile, topic_of_interest, countries2use, start_date[topic_of_interest])
+dates_in_use         = data_full$dates_in_use
+dates_in_use_decimal = decimal_date(dates_in_use)
+data = cbind(data_full$data,dates_in_use_decimal)
+```
+It's worthwhile getting a sense of how much information we actually have.  Count the non-zero entries per country:
+
+```{r}
+apply(data , 2, function(x){length(which(x>0 & !is.na(x)))})
+```
+
+And if we drop the rows with at least one NA we get:
+
+```{r}
+apply(drop_na(as_tibble(data)) , 2, function(x){length(which(x>0 & !is.na(x)))})
+```
+
+
+
+
+
+
+```{r }
+#| code-fold: true
+
+# First try imputing a value for zero.
+# the NMF was run with 40 topics, so a small value would be 0.01 / 40
+# implying that the observation is one hundredth the size of a uniform topic distribution at that time point.
+data_long_imputed = as_tibble(data) |> 
+          pivot_longer(cols = all_of(countries2use),
+                     names_to = "country", values_to = "Y")|>
+  mutate(country = factor(country)) |>
+  mutate(Y = ifelse(Y==0, .01/40, Y)) |> 
+  drop_na()
+
+data_long_remove = as_tibble(data) |> 
+          pivot_longer(cols = all_of(countries2use),
+                     names_to = "country", values_to = "Y")|>
+      mutate(country = factor(country)) |>
+      filter(Y>0 & ! is.na(Y))
+
+
+
+gam_all_in_one_impute = gam(Y~ s(dates_in_use_decimal, by = country),
+                                  family=betar(link="logit"),
+                                    data = data_long_imputed)
+
+gam_all_in_one_remove = gam(Y~ s(dates_in_use_decimal, by = country),
+                                  family=betar(link="logit"),
+                                    data = data_long_remove)
+```
+
+
+
+Check the residuals.   We should expect that the _impute_ strategy will have strange behaviour near the imputed values since those are all the same.
+
+
+```{r}
+summary(gam_all_in_one_impute)
+
+predictions <- predict(gam_all_in_one_impute, type = "response", se.fit = TRUE)
+your_data = data_long_imputed
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+data_long_remove
+ggplot(your_data, aes(x = dates_in_use_decimal, y = Y,color = country)) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  facet_wrap(~country)+
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for topic:", topic_of_interest),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_all_in_one_impute)
+```
+
+Qualitatively the fit should be pretty similar between the two methods, but the _impute_ strategy imposes scores of observations at a specified value.
+
+```{r}
+summary(gam_all_in_one_remove)
+
+predictions <- predict(gam_all_in_one_remove, type = "response", se.fit = TRUE)
+your_data = data_long_remove
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y = Y,color = country)) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  facet_wrap(~country)+
+  labs(title = paste("GAM model and CIs for mean DTP for topic:", topic_of_interest),
+       y = "DTP",
+       x = "remove 0 and NA")
+
+
+par(mfrow=c(2,2))
+gam.check(gam_all_in_one_remove)
+
+```
+
+
+
+
+
+```{r}
+#| echo: false
+countrynumber = 0 
+countries.2.use = countries2use|> gsub(pattern = "\\s",replacement =".")
+```
+
+
+
+
+:::
+
+## Now Model topic `r topic_of_interest` as a function of other countries.
+
+:::: panel-tabset
+
+```{r}
+#| echo: false
+countrynumber = countrynumber +1
+```
+
+## Modelling  Country `r countries2use[countrynumber]`
+
+```{r topic1country1}
+#| code-fold: true
+
+# First try imputing a value for zero.
+# the NMF was run with 40 topics, so a small value would be 0.01 / 40
+# implying that the observation is one hundredth the size of a uniform topic distribution at that time point.
+data_imputed = data
+# impute
+data_imputed[!is.na(data) & data==0] = .01/40
+colnames(data_imputed) = colnames(data_imputed) |> gsub(pattern = "\\s",replacement =".")
+data_imputed = as_tibble(data_imputed) |> 
+  drop_na()
+
+data_remove = data
+#remove
+data_remove[ data==0] = NA
+colnames(data_remove) = colnames(data_remove) |> gsub(pattern = "\\s",replacement =".")
+data_remove = as_tibble(data_remove) |> 
+  drop_na()
+
+
+
+
+gam_one_per_impute = gam(
+  as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_imputed)
+
+gam_one_per_remove = gam(as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_remove)
+```
+
+
+
+Check the residuals.   We should expect that the _impute_ strategy will have strange behaviour near the imputed values since those are all the same.
+
+
+```{r}
+summary(gam_one_per_impute)
+
+predictions <- predict(gam_one_per_impute, type = "response", se.fit = TRUE)
+your_data = data_imputed
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_impute)
+```
+
+Qualitatively the fit should be pretty similar between the two methods, but the _impute_ strategy imposes scores of observations at a specified value.
+
+```{r}
+summary(gam_one_per_remove)
+
+predictions <- predict(gam_one_per_remove, 
+                       newdata = data_remove,
+                       type = "response", 
+                       se.fit = TRUE)
+your_data = data_remove
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_remove)
+
+```
+
+```{r}
+#| echo: false
+countrynumber = countrynumber +1
+```
+
+## Modelling  Country `r countries2use[countrynumber]`
+
+```{r topic1country2}
+#| code-fold: true
+
+# First try imputing a value for zero.
+# the NMF was run with 40 topics, so a small value would be 0.01 / 40
+# implying that the observation is one hundredth the size of a uniform topic distribution at that time point.
+data_imputed = data
+# impute
+data_imputed[!is.na(data) & data==0] = .01/40
+colnames(data_imputed) = colnames(data_imputed) |> gsub(pattern = "\\s",replacement =".")
+data_imputed = as_tibble(data_imputed) |> 
+  drop_na()
+
+data_remove = data
+#remove
+data_remove[ data==0] = NA
+colnames(data_remove) = colnames(data_remove) |> gsub(pattern = "\\s",replacement =".")
+data_remove = as_tibble(data_remove) |> 
+  drop_na()
+
+
+
+
+gam_one_per_impute = gam(
+  as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_imputed)
+
+gam_one_per_remove = gam(as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_remove)
+```
+
+
+
+Check the residuals.   We should expect that the _impute_ strategy will have strange behaviour near the imputed values since those are all the same.
+
+
+```{r}
+summary(gam_one_per_impute)
+
+predictions <- predict(gam_one_per_impute, type = "response", se.fit = TRUE)
+your_data = data_imputed
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_impute)
+```
+
+Qualitatively the fit should be pretty similar between the two methods, but the _impute_ strategy imposes scores of observations at a specified value.
+
+```{r}
+summary(gam_one_per_remove)
+
+predictions <- predict(gam_one_per_remove, 
+                       newdata = data_remove,
+                       type = "response", 
+                       se.fit = TRUE)
+your_data = data_remove
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_remove)
+
+```
+```{r}
+#| echo: false
+countrynumber = countrynumber +1
+```
+
+## Modelling  Country `r countries2use[countrynumber]`
+
+```{r topic1country3}
+#| code-fold: true
+
+# First try imputing a value for zero.
+# the NMF was run with 40 topics, so a small value would be 0.01 / 40
+# implying that the observation is one hundredth the size of a uniform topic distribution at that time point.
+data_imputed = data
+# impute
+data_imputed[!is.na(data) & data==0] = .01/40
+colnames(data_imputed) = colnames(data_imputed) |> gsub(pattern = "\\s",replacement =".")
+data_imputed = as_tibble(data_imputed) |> 
+  drop_na()
+
+data_remove = data
+#remove
+data_remove[ data==0] = NA
+colnames(data_remove) = colnames(data_remove) |> gsub(pattern = "\\s",replacement =".")
+data_remove = as_tibble(data_remove) |> 
+  drop_na()
+
+
+
+
+gam_one_per_impute = gam(
+  as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_imputed)
+
+gam_one_per_remove = gam(as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_remove)
+```
+
+
+
+Check the residuals.   We should expect that the _impute_ strategy will have strange behaviour near the imputed values since those are all the same.
+
+
+```{r}
+summary(gam_one_per_impute)
+
+predictions <- predict(gam_one_per_impute, type = "response", se.fit = TRUE)
+your_data = data_imputed
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_impute)
+```
+
+Qualitatively the fit should be pretty similar between the two methods, but the _impute_ strategy imposes scores of observations at a specified value.
+
+```{r}
+summary(gam_one_per_remove)
+
+predictions <- predict(gam_one_per_remove, 
+                       newdata = data_remove,
+                       type = "response", 
+                       se.fit = TRUE)
+your_data = data_remove
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_remove)
+
+```
+```{r}
+#| echo: false
+countrynumber = countrynumber +1
+```
+
+## Modelling  Country `r countries2use[countrynumber]`
+
+```{r topic1country4}
+#| code-fold: true
+
+# First try imputing a value for zero.
+# the NMF was run with 40 topics, so a small value would be 0.01 / 40
+# implying that the observation is one hundredth the size of a uniform topic distribution at that time point.
+data_imputed = data
+# impute
+data_imputed[!is.na(data) & data==0] = .01/40
+colnames(data_imputed) = colnames(data_imputed) |> gsub(pattern = "\\s",replacement =".")
+data_imputed = as_tibble(data_imputed) |> 
+  drop_na()
+
+data_remove = data
+#remove
+data_remove[ data==0] = NA
+colnames(data_remove) = colnames(data_remove) |> gsub(pattern = "\\s",replacement =".")
+data_remove = as_tibble(data_remove) |> 
+  drop_na()
+
+
+
+
+gam_one_per_impute = gam(
+  as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_imputed)
+
+gam_one_per_remove = gam(as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_remove)
+```
+
+
+
+Check the residuals.   We should expect that the _impute_ strategy will have strange behaviour near the imputed values since those are all the same.
+
+
+```{r}
+summary(gam_one_per_impute)
+
+predictions <- predict(gam_one_per_impute, type = "response", se.fit = TRUE)
+your_data = data_imputed
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_impute)
+```
+
+Qualitatively the fit should be pretty similar between the two methods, but the _impute_ strategy imposes scores of observations at a specified value.
+
+```{r}
+summary(gam_one_per_remove)
+
+predictions <- predict(gam_one_per_remove, 
+                       newdata = data_remove,
+                       type = "response", 
+                       se.fit = TRUE)
+your_data = data_remove
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_remove)
+
+```
+```{r}
+#| echo: false
+countrynumber = countrynumber +1
+```
+
+## Modelling  Country `r countries2use[countrynumber]`
+
+```{r topic1country5}
+#| code-fold: true
+
+# First try imputing a value for zero.
+# the NMF was run with 40 topics, so a small value would be 0.01 / 40
+# implying that the observation is one hundredth the size of a uniform topic distribution at that time point.
+data_imputed = data
+# impute
+data_imputed[!is.na(data) & data==0] = .01/40
+colnames(data_imputed) = colnames(data_imputed) |> gsub(pattern = "\\s",replacement =".")
+data_imputed = as_tibble(data_imputed) |> 
+  drop_na()
+
+data_remove = data
+#remove
+data_remove[ data==0] = NA
+colnames(data_remove) = colnames(data_remove) |> gsub(pattern = "\\s",replacement =".")
+data_remove = as_tibble(data_remove) |> 
+  drop_na()
+
+
+
+
+gam_one_per_impute = gam(
+  as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_imputed)
+
+gam_one_per_remove = gam(as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_remove)
+```
+
+
+
+Check the residuals.   We should expect that the _impute_ strategy will have strange behaviour near the imputed values since those are all the same.
+
+
+```{r}
+summary(gam_one_per_impute)
+
+predictions <- predict(gam_one_per_impute, type = "response", se.fit = TRUE)
+your_data = data_imputed
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_impute)
+```
+
+Qualitatively the fit should be pretty similar between the two methods, but the _impute_ strategy imposes scores of observations at a specified value.
+
+```{r}
+summary(gam_one_per_remove)
+
+predictions <- predict(gam_one_per_remove, 
+                       newdata = data_remove,
+                       type = "response", 
+                       se.fit = TRUE)
+your_data = data_remove
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_remove)
+
+```
+```{r}
+#| echo: false
+countrynumber = countrynumber +1
+```
+
+## Modelling  Country `r countries2use[countrynumber]`
+
+```{r topic1country6}
+#| code-fold: true
+
+# First try imputing a value for zero.
+# the NMF was run with 40 topics, so a small value would be 0.01 / 40
+# implying that the observation is one hundredth the size of a uniform topic distribution at that time point.
+data_imputed = data
+# impute
+data_imputed[!is.na(data) & data==0] = .01/40
+colnames(data_imputed) = colnames(data_imputed) |> gsub(pattern = "\\s",replacement =".")
+data_imputed = as_tibble(data_imputed) |> 
+  drop_na()
+
+data_remove = data
+#remove
+data_remove[ data==0] = NA
+colnames(data_remove) = colnames(data_remove) |> gsub(pattern = "\\s",replacement =".")
+data_remove = as_tibble(data_remove) |> 
+  drop_na()
+
+
+
+
+gam_one_per_impute = gam(
+  as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_imputed)
+
+gam_one_per_remove = gam(as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_remove)
+```
+
+
+
+Check the residuals.   We should expect that the _impute_ strategy will have strange behaviour near the imputed values since those are all the same.
+
+
+```{r}
+summary(gam_one_per_impute)
+
+predictions <- predict(gam_one_per_impute, type = "response", se.fit = TRUE)
+your_data = data_imputed
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_impute)
+```
+
+Qualitatively the fit should be pretty similar between the two methods, but the _impute_ strategy imposes scores of observations at a specified value.
+
+```{r}
+summary(gam_one_per_remove)
+
+predictions <- predict(gam_one_per_remove, 
+                       newdata = data_remove,
+                       type = "response", 
+                       se.fit = TRUE)
+your_data = data_remove
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_remove)
+
+```
+```{r}
+#| echo: false
+countrynumber = countrynumber +1
+```
+
+## Modelling  Country `r countries2use[countrynumber]`
+
+```{r topic1country7}
+#| code-fold: true
+
+# First try imputing a value for zero.
+# the NMF was run with 40 topics, so a small value would be 0.01 / 40
+# implying that the observation is one hundredth the size of a uniform topic distribution at that time point.
+data_imputed = data
+# impute
+data_imputed[!is.na(data) & data==0] = .01/40
+colnames(data_imputed) = colnames(data_imputed) |> gsub(pattern = "\\s",replacement =".")
+data_imputed = as_tibble(data_imputed) |> 
+  drop_na()
+
+data_remove = data
+#remove
+data_remove[ data==0] = NA
+colnames(data_remove) = colnames(data_remove) |> gsub(pattern = "\\s",replacement =".")
+data_remove = as_tibble(data_remove) |> 
+  drop_na()
+
+
+
+
+gam_one_per_impute = gam(
+  as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_imputed)
+
+gam_one_per_remove = gam(as.formula( paste(countries2use[countrynumber], "~", "s(dates_in_use_decimal)+s(",  
+  paste(countries.2.use[-countrynumber], collapse = ")+s("),")")),
+                                  family=betar(link="logit"),
+                                    data = data_remove)
+```
+
+
+
+Check the residuals.   We should expect that the _impute_ strategy will have strange behaviour near the imputed values since those are all the same.
+
+
+```{r}
+summary(gam_one_per_impute)
+
+predictions <- predict(gam_one_per_impute, type = "response", se.fit = TRUE)
+your_data = data_imputed
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_impute)
+```
+
+Qualitatively the fit should be pretty similar between the two methods, but the _impute_ strategy imposes scores of observations at a specified value.
+
+```{r}
+summary(gam_one_per_remove)
+
+predictions <- predict(gam_one_per_remove, 
+                       newdata = data_remove,
+                       type = "response", 
+                       se.fit = TRUE)
+your_data = data_remove
+your_data$predicted <- predictions$fit
+your_data$se_fit <- predictions$se.fit
+
+
+
+
+ggplot(your_data, aes(x = dates_in_use_decimal, y =  .data[[countries2use[countrynumber]]])) +
+  geom_point() +
+  geom_line(aes(y = predicted)) +
+  geom_ribbon(aes(ymin = predicted - 1.96 * se_fit, ymax = predicted + 1.96 * se_fit), alpha = 0.2, fill = "blue") +
+  labs(title = paste("GAM model and predictions with CIs for mean DTP for country:", countries2use[countrynumber]),
+       y = "DTP",
+       x = "replace 0 with .01/40, remove NA")
+
+par(mfrow=c(2,2))
+gam.check(gam_one_per_remove)
+
+```
+
+::::
+
+
+## Eventual Next Topic
+
+
+:::
