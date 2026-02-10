@@ -650,6 +650,7 @@ dataload = function(datafile, topic_of_interest = NULL, countries2use = NULL, st
       filter(anchor == topic_of_interest)|>
       pivot_wider( names_from = country,
                  values_from = avg_proportion) |>
+      rename_all(make.names)
       arrange(date)|>
       filter(date >= start_date)
     if(!is.null(countries2use)){
@@ -665,7 +666,7 @@ dataload = function(datafile, topic_of_interest = NULL, countries2use = NULL, st
       arrange(date)|>
       filter(date >= start_date)
     if(!is.null(countries2use)){
-      data = data |> dplyr::filter(country %in% countries2use)
+      data = data |> dplyr::filter(country %in% countries2use) |> rename_all(make.names)
     }
     datause   = data |> select(-c("date", "country")) |> as.matrix()
     countries = data |> select(country)
@@ -680,7 +681,6 @@ dataload = function(datafile, topic_of_interest = NULL, countries2use = NULL, st
               countries = countries))
   
 }
-
 
 
 ## logprior_SS
