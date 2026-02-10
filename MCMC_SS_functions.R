@@ -643,42 +643,43 @@ Run_PT_SS = function(niter,  #MCMC iterations
 
 
 ## dataload
-dataload = function(datafile, topic_of_interest = NULL, countries2use, start_date = ymd("2008-01-01")){
-  
+dataload = function(datafile, topic_of_interest = NULL, countries2use = NULL, start_date = ymd("2008-01-01")){
   dataset = read_csv(datafile)
   if(!is.null(topic_of_interest)){
-  data = dataset |> 
-    filter(anchor == topic_of_interest)|>
-    pivot_wider( names_from = country, 
+    data = dataset |>
+      filter(anchor == topic_of_interest)|>
+      pivot_wider( names_from = country,
                  values_from = avg_proportion) |>
-    arrange(date)|>
-    select(contains(c(countries2use, "date", "anchor")))|> 
-    filter(date >= start_date)
+      arrange(date)|>
+      filter(date >= start_date)
+    if(!is.null(countries2use)){
+      datause = data |> select(contains(countries2use))|> as.matrix()
+    }else{
+      datause =   data |> select(-c("date", "anchor")) |> as.matrix()
+      countries = NULL
+    }
   }else{
-    data = dataset |> 
-      pivot_wider( names_from = country, 
+    data = dataset |>
+      pivot_wider( names_from = anchor,
                    values_from = avg_proportion) |>
       arrange(date)|>
-      select(contains(c(countries2use, "date", "anchor")))|> 
       filter(date >= start_date)
-  }  
+    if(!is.null(countries2use)){
+      data = data |> dplyr::filter(country %in% countries2use)
+    }
+    datause   = data |> select(-c("date", "country")) |> as.matrix()
+    countries = data |> select(country)
+  }
+
   dates_in_use =   data |> pull(date)
-  
-  data =   data |> select(-c("date", "anchor")) |> as.matrix()
-  
   alphas = matrix(0, nrow = nrow(data), ncol = ncol(data))
   alphas[!is.na(data)] = 1
-  
   return(list(dates_in_use = dates_in_use,
-              data   =   data,
-              alphas = alphas))
+              data   =   datause,
+              alphas = alphas,
+              countries = countries))
   
 }
-
-
-
-
-
 
 
 
