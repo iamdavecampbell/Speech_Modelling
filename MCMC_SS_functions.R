@@ -643,9 +643,10 @@ Run_PT_SS = function(niter,  #MCMC iterations
 
 
 ## dataload
-dataload = function(datafile, topic_of_interest, countries2use, start_date = ymd("2008-01-01")){
+dataload = function(datafile, topic_of_interest = NULL, countries2use, start_date = ymd("2008-01-01")){
   
   dataset = read_csv(datafile)
+  if(!is.null(topic_of_interest)){
   data = dataset |> 
     filter(anchor == topic_of_interest)|>
     pivot_wider( names_from = country, 
@@ -653,7 +654,14 @@ dataload = function(datafile, topic_of_interest, countries2use, start_date = ymd
     arrange(date)|>
     select(contains(c(countries2use, "date", "anchor")))|> 
     filter(date >= start_date)
-  
+  }else{
+    data = dataset |> 
+      pivot_wider( names_from = country, 
+                   values_from = avg_proportion) |>
+      arrange(date)|>
+      select(contains(c(countries2use, "date", "anchor")))|> 
+      filter(date >= start_date)
+  }  
   dates_in_use =   data |> pull(date)
   
   data =   data |> select(-c("date", "anchor")) |> as.matrix()
