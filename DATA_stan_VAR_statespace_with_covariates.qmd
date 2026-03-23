@@ -1,0 +1,1133 @@
+---
+title: "Bayesian State Space Model in Stan"
+format: 
+  html:
+    html-math-method: mathjax
+    echo: true
+    eval: true
+---
+
+
+
+## State Space Model:
+
+State space models are a generalization of time series models, where the observations are driven by an underlying stochastic transition process, but may be observed with noise.   
+We could just use a full Gaussian process model to interpolate the missing (partial) vector values and also propagate the model forward, but that tends to be very slow since the covaraince needs factorizing at every iteration.   See earlier versions of this code if you like inefficient code that converges very slowly.
+
+
+A state space formulation implies that there is some stochastic process for the mean and we observe some stochastic process.   The observation process allows for the scenario where a Bank doesn't give speeches in a given month ($\alpha = 0$) or something else comes up.  The transition process models the evolution of topic importance, whereas the observation process allows those topics to be observed with noise.  Here "with noise" implies that a central bank only gives a sample of speeches in any time period.
+
+
+
+
+#### Observation process:
+
+
+Let $(y_{t,k})$ denote the topic proportion for month \(t\) and country \(k\). To keep the model fast enough for routine imputation, we represent each country's latent trajectory with a first-order state-space Gaussian process,
+
+$$f_{1,k} \sim \mathcal{N}\left(\mu_k, \alpha_k^2\right),
+\qquad
+f_{t,k} \mid f_{t-1,k} \sim \mathcal{N}\left(
+\mu_k + \phi_k \left(f_{t-1,k} - \mu_k\right),
+\alpha_k^2 \left(1 - \phi_k^2\right)
+\right),$$
+
+where $(\phi_k = \exp(-1 / \rho_k)),  $(\rho_k)$ is the temporal length scale for country \(k\), and (\alpha_k)$ is the marginal scale. Marginally, this is still a Gaussian process with covariance
+
+
+$$\mathrm{Cov}\left(f_{t,k}, f_{t',k}\right)
+= \alpha_k^2 \phi_k^{|t-t'|}
+= \alpha_k^2 \exp\left(-\frac{|t-t'|}{\rho_k}\right).
+$$
+
+This ensures a coherent GP prior while avoiding repeated dense covariance factorizations. Conditional on the latent GP $f_{tk}$ values at month (t), the vector of observations across countries is
+
+$$\mathbf{y}_t \mid \mathbf{f}_t \sim \mathcal{N}_K\left(\mathbf{f}_t, \Sigma\right),
+\qquad
+\Sigma = \mathrm{diag}(\boldsymbol{\sigma}) \, \Omega \, \mathrm{diag}(\boldsymbol{\sigma}),$$
+
+with correlation matrix $(\Omega)$ between the K countries, and $(\boldsymbol{\sigma})$ country-specific scales. This cross-country covariance enables missing values to be sampled as additional parameters conditional on countries observed in the same month.
+
+If a given month is partitioned into observed countries \(o\) and missing countries \(m\), then the model implies the Gaussian conditional distribution
+
+$$\mathbf{y}_{t,m} \mid \mathbf{y}_{t,o}, \mathbf{f}_t, \Sigma
+\sim
+\mathcal{N}\left(
+\mathbf{f}_{t,m} +
+\Sigma_{mo}\Sigma_{oo}^{-1}\left(\mathbf{y}_{t,o} - \mathbf{f}_{t,o}\right),
+\;
+\Sigma_{mm} - \Sigma_{mo}\Sigma_{oo}^{-1}\Sigma_{om}
+\right).$$
+This is the usual GP formulation where the mean for the missing values is updated conditional on the deviation from the mean $\mathbf{y}_{t,o} - \mathbf{f}_{t,o}$.  The Covariance for the unobserved locations, $\Sigma_{mm}$, is reduced based on the covariance between missing and observed $\Sigma_{mo}$ scaled by the variance of the observed, $\Sigma_{oo}$. Stan samples the missing entries jointly with the hyperparameters, so posterior draws of the missing values are coherent with the fitted latent process and the learned cross-country covariance structure.
+
+This update differs from a hard-truncated sparse band diagonal kernel. In Stan,  zeroing distant covariances  still leaves a dense-enough covariance matrix that it must be factorized, limiting runtime improvements. The state-space form gives the main speed gain because it scales linearly in the number of time points instead of cubically with the full covariance.
+
+## Basics
+
+Note, when running as a script, we can define `Niter`,  and the saving `filename` externally. Defaults, if not provided, are `Niter = 60000`,  and `filename = "gp_panel_results_inflat.Rdata"`.
+
+```{r version}
+#| code-fold: true
+#| message: false
+#| eval: true
+version
+library(tidyverse)
+library(rlang)
+library(lubridate)
+library(readxl) # read in from excel
+library(rstan)
+library(coda)
+library(reshape2)
+library(bayesplot)
+options(mc.cores = 4)
+rstan_options(auto_write = TRUE)
+source("MCMC_functions.R")
+```
+
+## User Defined Options
+
+Basic things like the location of data file (**datafolder** ) and its filename  (**datafile**).  The choice of topics (**topic_of_interest**) is another option and some suggested values are provided.   More can be obtained by running:
+
+```{r code suggestion}
+#| eval: true
+datafile_preview <- if (exists("datafile")) datafile else "./nmf-time-series-g20.csv"
+read_csv(datafile_preview) |> pull(anchor)|> unique()
+```
+
+Countries to select can also be selected (**countries2use**) and again some options are provided.  Running Canada and the US is fastest.   The G7 countries takes around 45 minutes for 1,000 iterations.   
+
+
+Finally some other useful options include a file prefix for saving the output (**prefix**), and logical for starting the MCMC from a good place (**use_warm_start**), and either starting points from a previous run if given in (**warm_start_file**), or if left null, reasonable data driven values are selected by infilling missing values through linear interpolation and parameters from basic slice and dice of the data.  Finally the number of iterations is selected.  Using a warm start we can get away with like 5k-10k iterations, which for G7 takes ~4-8 hours to run.
+
+Covariate values are held in an excel file named **covariate_file** and named **covariateset**.  Stan code is easy to run as embarrasingly  parallel processes, so here we'll run 2 chains
+```{r user_defined_options}
+#| eval: true
+datafolder <- "./"
+datafile <- paste0(datafolder, "nmf-time-series-g20.csv")
+covariate_file <- paste0(datafolder, "macro_control_vars.xlsx")
+covariateset = c("realGDP","headlineInflation","policyRate")
+
+candidate_topics  <- c("inflat" ,"brexit", "covid", "cbdc", "ukrain" )
+topic_of_interest <- candidate_topics[1]
+
+G7_countries <- c(
+  "Canada",
+  "France",
+  "Germany",
+  "Italy",
+  "Japan",
+  "United Kingdom",
+  "United States"
+)
+CanUS <- c(
+  "Canada",
+  "United States"
+)
+
+countries2use <- G7_countries
+
+# start of dataset
+start_date = ymd("2008-11-01")
+# otherwise the month before the first mention in the dataset.
+if(topic_of_interest=="brexit"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="covid"){
+  start_date = ymd("2020-01-01")
+}
+if(topic_of_interest=="cbdc"){
+  start_date = ymd("2016-02-01")
+}
+if(topic_of_interest=="ukrain"){
+  start_date = ymd("2014-03-01")
+}
+
+prefix <- "codex_gp_"
+use_warm_start <- TRUE
+warm_start_file <- NULL
+Niter <- 5000
+
+chains = 2
+```
+
+
+
+## Data Loading
+
+
+From here it's all automated.   Data loading is handled using a helper function.   May as well make a plot of the data while we're here.
+```{r dataload}
+#| eval: true
+data_full <- dataload(datafile, topic_of_interest, countries2use, start_date)
+covariates_raw = covariateload(covariate_file,
+                covariateset,
+                countries2use,
+                start_date,
+                missing = "step_function")
+
+
+
+dates_in_use <- data_full$dates_in_use
+data <- data_full$data
+country_names <- colnames(data)
+
+last_non_missing <- function(x) {
+  idx <- which(!is.na(x))
+  if (length(idx) == 0) {
+    return(NA_real_)
+  }
+  x[max(idx)]
+}
+
+covariates <- covariates_raw |>
+  mutate(month = floor_date(as.Date(date), unit = "month")) |>
+  group_by(month) |>
+  summarise(
+    across(-date, last_non_missing),
+    .groups = "drop"
+  )
+
+covariates <- tibble(
+  date = dates_in_use,
+  month = floor_date(dates_in_use, unit = "month")
+) |>
+  left_join(covariates, by = "month") |>
+  select(-month)
+
+complete_covariate_rows <- complete.cases(covariates)
+if (!all(complete_covariate_rows)) {
+  dates_in_use <- dates_in_use[complete_covariate_rows]
+  data <- data[complete_covariate_rows, , drop = FALSE]
+  covariates <- covariates[complete_covariate_rows, , drop = FALSE]
+  data_full$dates_in_use <- dates_in_use
+  data_full$data <- data
+}
+
+matplot(
+  x = dates_in_use,
+  y = data,
+  type = "l",
+  lty = 1,
+  main = topic_of_interest,
+  ylab = "Topic Proportion",
+  xlab = "Date"
+)
+legend(
+  "topright",
+  legend = country_names,
+  col = seq_along(countries2use),
+  lty = 1,
+  cex = 0.7,
+  bty = "n"
+)
+```
+
+## Stan Model
+
+Here's the guts of the model, coded in stan.   All is written out here and then saved as a **.stan** file.  
+
+```{r stan_model}
+#| code-fold: true
+stan_file <- "stan_gp_panel_missing.stan"
+
+stan_code <- '
+data {
+  int<lower=1> T;
+  int<lower=1> K;
+  int<lower=1> C;
+  array[K] matrix[T, C] X;
+  int<lower=0> N_obs;
+  array[N_obs] int<lower=1, upper=T> obs_t;
+  array[N_obs] int<lower=1, upper=K> obs_k;
+  vector[N_obs] y_obs;
+  int<lower=0> N_mis;
+  array[N_mis] int<lower=1, upper=T> mis_t;
+  array[N_mis] int<lower=1, upper=K> mis_k;
+}
+
+parameters {
+  vector[K] mu;
+  matrix[C, K] beta;
+  vector<lower=0>[K] alpha;
+  vector<lower=0>[K] rho;
+  matrix[T, K] z;
+  vector<lower=0>[K] sigma_country;
+  cholesky_factor_corr[K] L_Omega;
+  vector<lower=0>[N_mis] y_mis;
+}
+
+transformed parameters {
+  matrix[T, K] f;
+  matrix[T, K] g;
+  matrix[T, K] y_complete;
+  matrix[K, K] L_Sigma;
+  vector<lower=0, upper=1>[K] phi;
+
+  L_Sigma = diag_pre_multiply(sigma_country, L_Omega);
+  y_complete = rep_matrix(0.0, T, K);
+  for (k in 1:K) {
+    phi[k] = exp(-1 / rho[k]);
+  }
+
+  for (n in 1:N_obs) {
+    y_complete[obs_t[n], obs_k[n]] = y_obs[n];
+  }
+  for (n in 1:N_mis) {
+    y_complete[mis_t[n], mis_k[n]] = y_mis[n];
+  }
+
+  for (k in 1:K) {
+    vector[T] xbeta;
+    xbeta = X[k] * beta[, k];
+    g[1, k] = alpha[k] * z[1, k];
+    f[1, k] = mu[k] + xbeta[1] + g[1, k];
+    for (t in 2:T) {
+      g[t, k] = phi[k] * g[t - 1, k]
+        + alpha[k] * sqrt(1 - square(phi[k])) * z[t, k];
+      f[t, k] = mu[k] + xbeta[t] + g[t, k];
+    }
+  }
+}
+
+model {
+  mu ~ normal(0.02, 0.05);
+  to_vector(beta) ~ normal(0, 0.5);
+  alpha ~ normal(0, 0.05);
+  rho ~ lognormal(log(18), 0.75);
+  sigma_country ~ normal(0, 0.05);
+  L_Omega ~ lkj_corr_cholesky(2);
+  to_vector(z) ~ std_normal();
+
+  for (t in 1:T) {
+    vector[K] y_t;
+    vector[K] f_t;
+    for (k in 1:K) {
+      y_t[k] = y_complete[t, k];
+      f_t[k] = f[t, k];
+    }
+    y_t ~ multi_normal_cholesky(f_t, L_Sigma);
+  }
+}
+
+generated quantities {
+  corr_matrix[K] Omega;
+  cov_matrix[K] Sigma_country;
+
+  Omega = multiply_lower_tri_self_transpose(L_Omega);
+  Sigma_country = quad_form_diag(Omega, sigma_country);
+}
+'
+
+writeLines(stan_code, stan_file)
+cat("Wrote Stan program to", stan_file, "\n")
+```
+
+## Prepare For Stan
+
+This is mainly helper functions to deal with finding a strong starting point and passing data to stan as a list.
+
+
+```{r preamble}
+#| code-fold: true
+#| eval: true
+# if (!exists("Niter")) {
+#   Niter <- 60000
+# }
+# if (!exists("seed")) {
+#   seed <- 1234567890
+# }
+if (!exists("chains")) {
+  chains <- 2
+}
+if (!exists("filename")) {
+  filename <- paste0(
+    prefix,
+    "codex_GP_",
+    topic_of_interest,
+    "_results_",
+    paste0(countries2use, collapse = "_"),
+    "_",
+    Niter,
+    "_",
+    chains,
+    "chains.Rdata"
+  )
+}
+
+if (isTRUE(use_warm_start) && is.null(warm_start_file) && file.exists(filename)) {
+  warm_start_file <- filename
+}
+
+data_for_model <- data
+missing_mask <- is.na(data_for_model) | data_for_model == 0
+observed_mask <- !missing_mask
+
+obs_idx <- which(observed_mask, arr.ind = TRUE)
+mis_idx <- which(missing_mask, arr.ind = TRUE)
+
+covariate_columns_by_country <- lapply(country_names, function(country) {
+  paste0(covariateset, "_", country)
+})
+names(covariate_columns_by_country) <- country_names
+
+missing_covariate_columns <- unlist(
+  covariate_columns_by_country[
+    vapply(
+      covariate_columns_by_country,
+      function(cols) !all(cols %in% colnames(covariates)),
+      logical(1)
+    )
+  ],
+  use.names = FALSE
+)
+
+if (length(missing_covariate_columns) > 0) {
+  stop(
+    "Missing expected covariate columns: ",
+    paste(unique(missing_covariate_columns), collapse = ", ")
+  )
+}
+
+covariate_array <- lapply(country_names, function(country) {
+  cols <- paste0(covariateset, "_", country)
+  X_country <- covariates |>
+    select(all_of(cols)) |>
+    as.matrix()
+  storage.mode(X_country) <- "double"
+  colnames(X_country) <- covariateset
+
+  column_means <- colMeans(X_country)
+  column_sds <- apply(X_country, 2, sd)
+  column_sds[!is.finite(column_sds) | column_sds < 1e-8] <- 1
+
+  X_country <- sweep(X_country, 2, column_means, "-")
+  X_country <- sweep(X_country, 2, column_sds, "/")
+
+  X_country
+})
+names(covariate_array) <- country_names
+
+stan_data <- list(
+  T = nrow(data_for_model),
+  K = ncol(data_for_model),
+  C = length(covariateset),
+  X = covariate_array,
+  N_obs = nrow(obs_idx),
+  obs_t = if (nrow(obs_idx) > 0) obs_idx[, 1] else integer(0),
+  obs_k = if (nrow(obs_idx) > 0) obs_idx[, 2] else integer(0),
+  y_obs = if (nrow(obs_idx) > 0) data_for_model[observed_mask] else numeric(0),
+  N_mis = nrow(mis_idx),
+  mis_t = if (nrow(mis_idx) > 0) mis_idx[, 1] else integer(0),
+  mis_k = if (nrow(mis_idx) > 0) mis_idx[, 2] else integer(0)
+)
+
+cat("Observed values:", stan_data$N_obs, "\n")
+cat("Missing values to impute:", stan_data$N_mis, "\n")
+cat("Country-specific covariates per GP:", stan_data$C, "\n")
+cat("Results file:", filename, "\n")
+cat(
+  "Warm start source:",
+  if (isTRUE(use_warm_start)) {
+    if (is.null(warm_start_file)) "data-driven initialization" else warm_start_file
+  } else {
+    "disabled"
+  },
+  "\n"
+)
+
+fill_missing_panel <- function(x) {
+  x_filled <- x
+  fallback_value <- median(x[!is.na(x) & x > 0], na.rm = TRUE)
+  if (!is.finite(fallback_value)) {
+    fallback_value <- 0.02
+  }
+
+  for (k in seq_len(ncol(x_filled))) {
+    observed <- which(!is.na(x_filled[, k]) & x_filled[, k] > 0)
+
+    if (length(observed) == 0) {
+      x_filled[, k] <- fallback_value
+    } else if (length(observed) == 1) {
+      x_filled[, k] <- x_filled[observed, k]
+    } else {
+      x_filled[, k] <- approx(
+        x = observed,
+        y = x_filled[observed, k],
+        xout = seq_len(nrow(x_filled)),
+        method = "linear",
+        rule = 2
+      )$y
+    }
+  }
+
+  x_filled
+}
+
+build_data_warm_init <- function(data_for_model, missing_mask, stan_data) {
+  filled <- fill_missing_panel(data_for_model)
+  T <- nrow(filled)
+  K <- ncol(filled)
+  C <- stan_data$C
+  beta_init <- matrix(0, nrow = C, ncol = K)
+  mu_init <- numeric(K)
+  alpha_init <- numeric(K)
+  phi_init <- rep(0.95, K)
+  residual_filled <- matrix(0, nrow = T, ncol = K)
+
+  for (k in seq_len(K)) {
+    Xk <- stan_data$X[[k]]
+    fit_k <- tryCatch(
+      lm.fit(x = cbind(1, Xk), y = filled[, k]),
+      error = function(e) NULL
+    )
+
+    if (!is.null(fit_k) && length(fit_k$coefficients) == C + 1) {
+      coef_k <- fit_k$coefficients
+      coef_k[!is.finite(coef_k)] <- 0
+      mu_init[k] <- coef_k[1]
+      beta_init[, k] <- coef_k[-1]
+    } else {
+      mu_init[k] <- mean(filled[, k])
+    }
+
+    residual_filled[, k] <- filled[, k] - mu_init[k] - Xk %*% beta_init[, k]
+    alpha_init[k] <- max(sd(residual_filled[, k]), 0.01)
+  }
+
+  for (k in seq_len(K)) {
+    centered <- residual_filled[, k]
+    lagged <- centered[-T]
+    current <- centered[-1]
+    denom <- sum(lagged^2)
+
+    if (is.finite(denom) && denom > 1e-10) {
+      phi_raw <- sum(lagged * current) / denom
+      phi_init[k] <- min(max(phi_raw, 0.80), 0.995)
+    }
+  }
+
+  rho_init <- pmax(-1 / log(phi_init), 0.5)
+  innovation_scale <- alpha_init * sqrt(pmax(1 - phi_init^2, 1e-6))
+  z_init <- matrix(0, nrow = T, ncol = K)
+
+  for (k in seq_len(K)) {
+    z_init[1, k] <- residual_filled[1, k] / alpha_init[k]
+    for (t in 2:T) {
+      z_init[t, k] <- (
+        residual_filled[t, k] -
+          phi_init[k] * residual_filled[t - 1, k]
+      ) / innovation_scale[k]
+    }
+  }
+
+  y_mis_init <- if (stan_data$N_mis > 0) {
+    pmax(filled[missing_mask], 1e-6)
+  } else {
+    numeric(0)
+  }
+
+  list(
+    mu = mu_init,
+    beta = beta_init,
+    alpha = alpha_init,
+    rho = rho_init,
+    z = z_init,
+    sigma_country = pmax(alpha_init * 0.25, 0.01),
+    L_Omega = diag(K),
+    y_mis = y_mis_init
+  )
+}
+
+load_saved_fit <- function(path) {
+  file_ext <- tolower(tools::file_ext(path))
+
+  if (file_ext == "rds") {
+    fit_obj <- readRDS(path)
+  } else {
+    fit_env <- new.env(parent = emptyenv())
+    loaded_names <- load(path, envir = fit_env)
+    stanfit_names <- loaded_names[
+      vapply(
+        loaded_names,
+        function(nm) inherits(fit_env[[nm]], "stanfit"),
+        logical(1)
+      )
+    ]
+
+    if (length(stanfit_names) == 0) {
+      stop("No stanfit object found in ", path)
+    }
+    fit_obj <- fit_env[[stanfit_names[1]]]
+  }
+
+  if (!inherits(fit_obj, "stanfit")) {
+    stop(path, " does not contain a stanfit object.")
+  }
+
+  fit_obj
+}
+
+build_fit_warm_init <- function(path, stan_data, data_for_model, missing_mask) {
+  fit_obj <- load_saved_fit(path)
+  draws <- rstan::extract(
+    fit_obj,
+    pars = c("mu", "beta", "alpha", "rho", "z", "sigma_country", "L_Omega", "y_mis")
+  )
+  required_pars <- c("mu", "beta", "alpha", "rho", "z", "sigma_country", "L_Omega")
+
+  missing_required <- setdiff(required_pars, names(draws))
+  if (length(missing_required) > 0) {
+    stop(
+      "Warm start fit is missing required parameters: ",
+      paste(missing_required, collapse = ", ")
+    )
+  }
+
+  n_draws <- dim(draws$mu)[1]
+  draw_id <- n_draws
+  fallback_init <- build_data_warm_init(data_for_model, missing_mask, stan_data)
+
+  if (
+    length(draws$mu[draw_id, ]) != stan_data$K ||
+      nrow(draws$beta[draw_id, , ]) != stan_data$C ||
+      ncol(draws$beta[draw_id, , ]) != stan_data$K ||
+      ncol(draws$z[draw_id, , ]) != stan_data$K ||
+      nrow(draws$z[draw_id, , ]) != stan_data$T
+  ) {
+    stop("Warm start fit dimensions do not match the current panel.")
+  }
+
+  y_mis_init <- fallback_init$y_mis
+  if (stan_data$N_mis > 0 && "y_mis" %in% names(draws)) {
+    if (length(draws$y_mis[draw_id, ]) == stan_data$N_mis) {
+      y_mis_init <- pmax(draws$y_mis[draw_id, ], 1e-6)
+    }
+  }
+
+  list(
+    mu = as.numeric(draws$mu[draw_id, ]),
+    beta = draws$beta[draw_id, , ],
+    alpha = pmax(as.numeric(draws$alpha[draw_id, ]), 1e-4),
+    rho = pmax(as.numeric(draws$rho[draw_id, ]), 0.1),
+    z = draws$z[draw_id, , ],
+    sigma_country = pmax(as.numeric(draws$sigma_country[draw_id, ]), 1e-4),
+    L_Omega = draws$L_Omega[draw_id, , ],
+    y_mis = y_mis_init
+  )
+}
+
+jitter_warm_init <- function(init_list, chain_id) {
+  jitter_scale <- 0.02 * chain_id
+
+  list(
+    mu = init_list$mu + rnorm(length(init_list$mu), 0, 0.01 + jitter_scale / 2),
+    beta = init_list$beta + matrix(
+      rnorm(length(init_list$beta), 0, 0.02 + jitter_scale / 2),
+      nrow = nrow(init_list$beta),
+      ncol = ncol(init_list$beta)
+    ),
+    alpha = pmax(
+      init_list$alpha * exp(rnorm(length(init_list$alpha), 0, jitter_scale)),
+      1e-4
+    ),
+    rho = pmax(
+      init_list$rho * exp(rnorm(length(init_list$rho), 0, jitter_scale)),
+      0.1
+    ),
+    z = init_list$z + matrix(
+      rnorm(length(init_list$z), 0, 0.05 + jitter_scale),
+      nrow = nrow(init_list$z),
+      ncol = ncol(init_list$z)
+    ),
+    sigma_country = pmax(
+      init_list$sigma_country * exp(
+        rnorm(length(init_list$sigma_country), 0, jitter_scale)
+      ),
+      1e-4
+    ),
+    L_Omega = init_list$L_Omega,
+    y_mis = pmax(
+      init_list$y_mis * exp(rnorm(length(init_list$y_mis), 0, jitter_scale)),
+      1e-6
+    )
+  )
+}
+
+make_init_function <- function(
+  use_warm_start,
+  warm_start_file,
+  data_for_model,
+  missing_mask,
+  stan_data
+) {
+  if (!isTRUE(use_warm_start)) {
+    return("random")
+  }
+
+  base_init <- NULL
+
+  if (!is.null(warm_start_file) && file.exists(warm_start_file)) {
+    base_init <- tryCatch(
+      build_fit_warm_init(
+        path = warm_start_file,
+        stan_data = stan_data,
+        data_for_model = data_for_model,
+        missing_mask = missing_mask
+      ),
+      error = function(e) {
+        message("Warm start from file failed: ", conditionMessage(e))
+        NULL
+      }
+    )
+  }
+
+  if (is.null(base_init)) {
+    base_init <- build_data_warm_init(data_for_model, missing_mask, stan_data)
+    message("Using data-driven warm start.")
+  } else {
+    message("Using posterior warm start from ", warm_start_file)
+  }
+
+  function(chain_id = 1) {
+    jitter_warm_init(base_init, chain_id)
+  }
+}
+
+init_fun <- make_init_function(
+  use_warm_start = use_warm_start,
+  warm_start_file = warm_start_file,
+  data_for_model = data_for_model,
+  missing_mask = missing_mask,
+  stan_data = stan_data
+)
+```
+
+## Run MCMC via Stan
+
+Stan uses the NUTS variant of Hamiltonian Monte Carlo. With this formulation, it's quite efficient, yet still slow since each of the **k** countries need their own missing values and covariances.
+
+```{r MCMC}
+#| code-fold: true
+#| eval: false
+T1 <- Sys.time()
+
+fit <- stan(
+  file = stan_file,
+  data = stan_data,
+  init = init_fun,
+  iter = Niter,
+  warmup = floor(Niter / 2),
+  chains = chains,
+  # seed = seed, # i don't generally like using a fixed seed, since then it is just a deterministic process.
+  algorithm = "NUTS",
+  refresh = max(1, floor(Niter / 20)),
+  control = list(
+    adapt_delta = 0.95,
+    max_treedepth = 12
+  )
+)
+
+elapsed <- Sys.time() - T1
+cat(
+  paste(
+    "total compute time:",
+    round(as.numeric(elapsed, units = "hours"), 2),
+    "hours.\n"
+  )
+)
+# save.image("5k iters.Rdata")
+```
+
+## Posterior Summaries
+
+
+```{r data_load_for_rendering}
+#| code-fold: true
+#| eval: true
+
+# load some data if it exists.
+# this is useful if you want to render this document.  It'll load the appropriate filename and go from there.
+
+if(filename %in% list.files( pattern = filename)){
+  load(filename)
+}
+
+```
+
+
+
+```{r posterior_summaries}
+#| eval: true
+#| code-fold: true
+fit_summary <- summary(
+  fit,
+  pars = c("mu", "alpha", "rho", "sigma_country")
+)$summary |>
+  as_tibble(rownames = "parameter")
+
+print(fit_summary)
+
+if (stan_data$N_mis > 0) {
+  mis_pars <- paste0("y_mis[", seq_len(stan_data$N_mis), "]")
+  mis_summary <- summary(fit, pars = mis_pars)$summary |>
+    as_tibble(rownames = "parameter") |>
+    mutate(
+      date = dates_in_use[stan_data$mis_t],
+      country = country_names[stan_data$mis_k]
+    ) |>
+    dplyr::select(
+      date,
+      country,
+      mean,
+      sd,
+      `2.5%`,
+      `25%`,
+      `50%`,
+      `75%`,
+      `97.5%`,
+      n_eff,
+      Rhat
+    )
+
+  print(mis_summary, n = min(25, nrow(mis_summary)))
+
+  posterior_mean_matrix <- data_for_model
+  posterior_mean_matrix[missing_mask] <- mis_summary$mean
+
+  posterior_plot_df <- posterior_mean_matrix |>
+    as.data.frame() |>
+    setNames(country_names) |>
+    mutate(date = dates_in_use) |>
+    pivot_longer(
+      cols = all_of(country_names),
+      names_to = "country",
+      values_to = "posterior_mean"
+    )
+
+  imputed_plot_df <- mis_summary |>
+    rename(
+      lower_95 = `2.5%`,
+      median_value = `50%`,
+      upper_95 = `97.5%`
+    )
+
+  ggplot() +
+    geom_linerange(
+      data = imputed_plot_df,
+      aes(ymin = lower_95, ymax = upper_95, x = date, color = country, group = country),
+      linewidth = 0.5,
+      alpha = 0.5,
+      show.legend = FALSE
+    ) +
+    geom_point(
+      data = imputed_plot_df,
+      aes(y = mean, x = date, color = country, group = country),
+      shape = 21,
+      fill = "white",
+      stroke = 0.9,
+      size = 2.2,
+      show.legend = FALSE
+    ) +
+    geom_line(
+      data = posterior_plot_df,
+      aes(x = date, y = posterior_mean, color = country, group = country),
+      linewidth = 0.8, alpha = 0.9) +
+    labs(
+      title = paste(topic_of_interest, "with posterior mean imputations"),
+      subtitle = "Imputed points are marked with 95% posterior intervals",
+      x = "Date",
+      y = "Topic Proportion",
+      color = "Country"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "right",
+      panel.grid.minor = element_blank()
+    )
+}
+```
+
+
+
+
+### Plot some basic disgnostics such as traceplots:
+
+
+```{r traceplots}
+#| eval: true
+#| code-fold: true
+plot(extract(fit, "lp__")[[1]],
+     ylab = "un-normalized log posterior")
+
+
+matplot(extract(fit, "mu")[[1]], type = 'l', main = "mu")
+pairs(extract(fit, "mu")[[1]], main = "mu")
+
+pairs(extract(fit, "rho")[[1]], main = "rho")
+
+
+pairs(extract(fit, "alpha")[[1]], main = "alpha")
+
+```
+
+
+
+### Show data fit
+
+```{r show_data_fit}
+#| eval: true
+#| code-fold: true
+fitted_mean_matrix <- data_for_model
+if (exists("mis_summary")) {
+  fitted_mean_matrix[missing_mask] <- mis_summary$mean
+}
+
+f_draws <- rstan::extract(fit, pars = "f")$f
+fitted_lower_matrix <- apply(f_draws, c(2, 3), quantile, probs = 0.025)
+fitted_upper_matrix <- apply(f_draws, c(2, 3), quantile, probs = 0.975)
+
+fitted_plot_df <- fitted_mean_matrix |>
+  as.data.frame() |>
+  setNames(country_names) |>
+  mutate(date = dates_in_use) |>
+  pivot_longer(
+    cols = all_of(country_names),
+    names_to = "country",
+    values_to = "fitted_mean"
+  )
+
+fitted_interval_df <- tibble(
+  date = rep(dates_in_use, times = length(country_names)),
+  country = rep(country_names, each = length(dates_in_use)),
+  fitted_lower_95 = as.vector(fitted_lower_matrix),
+  fitted_upper_95 = as.vector(fitted_upper_matrix)
+)
+
+observed_plot_df <- data_for_model |>
+  as.data.frame() |>
+  setNames(country_names) |>
+  mutate(date = dates_in_use) |>
+  pivot_longer(
+    cols = all_of(country_names),
+    names_to = "country",
+    values_to = "observed_value"
+  ) |>
+  filter(!is.na(observed_value), observed_value != 0) |>
+  mutate(
+    t_index = match(date, dates_in_use),
+    k_index = match(country, country_names)
+  ) |>
+  rowwise() |>
+  mutate(
+    fitted_lower_95 = quantile(f_draws[, t_index, k_index], 0.025),
+    fitted_median = median(f_draws[, t_index, k_index]),
+    fitted_upper_95 = quantile(f_draws[, t_index, k_index], 0.975)
+  ) |>
+  ungroup()
+
+ggplot() +
+  geom_ribbon(
+    data = fitted_interval_df,
+    aes(
+      x = date,
+      ymin = fitted_lower_95,
+      ymax = fitted_upper_95,
+      group = country
+    ),
+    alpha = 0.2,
+    fill = "black",
+    color = "black",
+    show.legend = FALSE
+  ) +
+  geom_line(
+    data = fitted_plot_df,
+    aes(x = date, y = fitted_mean, color = country, group = country),
+    linewidth = 0.9,
+    alpha = 0.9
+  ) +
+  # geom_linerange(
+  #   data = observed_plot_df,
+  #   aes(
+  #     x = date,
+  #     ymin = fitted_lower_95,
+  #     ymax = fitted_upper_95,
+  #     color = country
+  #   ),
+  #   linewidth = 0.5,
+  #   alpha = 0.45,
+  #   show.legend = FALSE
+  # ) +
+  geom_point(
+    data = observed_plot_df,
+    aes(x = date, y = observed_value, color = country),
+    size = 1.3,
+    alpha = 0.75
+  ) +
+  geom_line(
+    data = observed_plot_df,
+    aes(x = date, y = fitted_median),
+    colour = "black",
+    size = 1.8,
+    show.legend = FALSE
+  ) +
+  labs(
+    title = paste(topic_of_interest, "model fit to observed data"),
+    subtitle = paste(
+      "Lines show fitted posterior means;",
+      "observed points are overlaid with 95% fitted intervals"
+    ),
+    x = "Date",
+    y = "Topic Proportion",
+    color = "Country"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )+
+  facet_wrap(~country)
+```
+
+
+
+
+## Correlation matrix Omega
+
+```{r omega_plots}
+#| eval: true
+#| code-fold: true
+omega_draws <- rstan::extract(fit, pars = "Omega")$Omega
+
+omega_median <- apply(omega_draws, c(2, 3), median)
+omega_variance <- apply(omega_draws, c(2, 3), var)
+
+dimnames(omega_median) <- list(country_names, country_names)
+dimnames(omega_variance) <- list(country_names, country_names)
+
+omega_plot_df <- function(mat, value_name) {
+  expand.grid(
+    country_row = country_names,
+    country_col = country_names,
+    stringsAsFactors = FALSE
+  ) |>
+    mutate(
+      value = as.vector(mat),
+      country_row = factor(country_row, levels = rev(country_names)),
+      country_col = factor(country_col, levels = country_names)
+    ) |>
+    rename(!!value_name := value)
+}
+
+plot_omega_heatmap <- function(plot_data, fill_var, title_text, midpoint = NULL) {
+  p <- ggplot(
+    plot_data,
+    aes(x = country_col, y = country_row, fill = .data[[fill_var]])
+  ) +
+    geom_tile(color = "white", linewidth = 0.4) +
+    coord_equal() +
+    labs(
+      title = title_text,
+      x = NULL,
+      y = NULL,
+      fill = fill_var
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(hjust = 1)
+    )
+
+  if (!is.null(midpoint)) {
+    p <- p + scale_fill_gradient2(
+      low = "#2166ac",
+      mid = "#f7f7f7",
+      high = "#b2182b",
+      midpoint = midpoint,
+      limits = c(-1, 1)
+    )
+  } else {
+    p <- p + scale_fill_gradient(
+      low = "#f7fbff",
+      high = "#08306b"
+    )
+  }
+
+  p
+}
+
+omega_median_df <- omega_plot_df(omega_median, "median_correlation")
+omega_variance_df <- omega_plot_df(omega_variance, "correlation_variance")
+
+omega_median_plot <- plot_omega_heatmap(
+  omega_median_df,
+  fill_var = "median_correlation",
+  title_text = "Posterior median of Omega",
+  midpoint = 0
+)
+
+omega_variance_plot <- plot_omega_heatmap(
+  omega_variance_df,
+  fill_var = "correlation_variance",
+  title_text = "Posterior variance of Omega"
+)
+
+print(omega_median_plot)
+print(omega_variance_plot)
+
+output_stub <- tools::file_path_sans_ext(filename)
+omega_median_file <- paste0(output_stub, "_Omega_median.png")
+omega_variance_file <- paste0(output_stub, "_Omega_variance.png")
+
+ggsave(
+  filename = omega_median_file,
+  plot = omega_median_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  filename = omega_variance_file,
+  plot = omega_variance_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+cat("Saved Omega median image to", omega_median_file, "\n")
+cat("Saved Omega variance image to", omega_variance_file, "\n")
+```
+
+## Save Output
+
+```{r save_output}
+#| code-fold: true
+
+save(
+  fit,
+  stan_data,
+  data_for_model,
+  dates_in_use,
+  country_names,
+  topic_of_interest,
+  file = filename
+)
+cat("Saved fit and data objects to", filename, "\n")
+```
+
+
+
+## Running this on real data:
+
+- Code could be made more efficient using Sequential Monte Carlo. Stan is generally pretty good though.
+- Another reasonable solution is to go fully frequentist and optimize the marginal likelihood by integrating over the nuissance states **X** using Integrated Nested Laplace Approximation.  The package **tmb** is designed to do this quickly.
+- Use the script to extract the R code, because this will take a while to run. 
+
+```{r purl}
+#| eval: false
+
+knitr::purl("DATA_stan_VAR_codex.qmd")
+
+
+```

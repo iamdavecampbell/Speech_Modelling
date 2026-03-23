@@ -9,6 +9,7 @@
 # logpost          = calculate the log posterior
 # make_fake_data   = generate a fake dataset with missing values etc
 # dataload         = load the real dataset.
+# covariateload    = load the covariates.
 ############################
 
 
@@ -467,12 +468,12 @@ dataload = function(datafile, topic_of_interest, countries2use, start_date = ymd
     pivot_wider( names_from = country, 
                  values_from = avg_proportion) |>
     arrange(date)|>
-    select(contains(c(countries2use, "date", "anchor")))|> 
-    filter(date >= start_date)
+    dplyr::select(contains(c(countries2use, "date", "anchor")))|> 
+    dplyr::filter(date >= start_date)
   
   
   return(list(dates_in_use =   data |> pull(date),
-              data =   data |> select(-c("date", "anchor")) |> as.matrix()))
+              data =   data |> dplyr::select(-c("date", "anchor")) |> as.matrix()))
 }
 
 
@@ -727,6 +728,122 @@ make_fake_data = function(Nmissing = 25, Number_of_DTP0 = 1, Ncountries = 5, Nti
     )
 }
 
+
+###############
+## covariateload
+# covariate_file = excel sheet to load covariates from
+# covariateset   = sheet name to use
+# countries2use  = countries to use
+# start_date     = start date for the datset.
+# missing        = ignore them or use a step function to move from quarterly to monthly data, since that's what each country will know as the latest information.
+#                  note that this will also truncate teh dataset so that the first row has no NA values.
+###### NOTE THIS WILL LOAD THE 2 DIGIT COUNTRY CODES
+###############
+covariateload = function(covariate_file,
+                         covariateset,
+                         countries2use,
+                         start_date,
+                         missing = c("ignore","step_function")){
+  require(glue)
+  require(readxl)
+  require(dplyr)
+  # other countries will need to be edited in.  
+  
+  if("2digit_country_codes.csv"%in% list.files()){
+    helper_table_names = read_csv("2digit_country_codes.csv")
+  }else{# try pulling the table from source
+      require(tidyverse)
+      require(rvest)
+      
+      # URL
+      url <- "https://www.iban.com/country-codes"
+      
+      # Read HTML
+      page <- read_html(url)
+      
+      # Extract all tables
+      tables <- page %>% html_table(fill = TRUE)
+      
+      # Inspect tables (optional)
+      # length(tables)
+      # names(tables[[1]])
+      
+      # The first table on the page contains:
+      # Country | Alpha-2 code | Alpha-3 code | Numeric
+      
+      helper_table_names <- tables[[1]] %>%
+        as_tibble() %>%
+        janitor::clean_names() %>%
+        select(country = country,
+               alpha2 = alpha_2_code)
+      helper_table_names |> write_csv("2digit_country_codes.csv") # save it for next time.
+  }
+
+  
+  helper_table_names = helper_table_names |>
+    mutate(country = ifelse(country== "United Kingdom of Great Britain and Northern Ireland (the)",
+                            "United Kingdom",
+                            country))|>
+    mutate(country = ifelse(country== "United States of America (the)",
+                            "United States",
+                            country))|>
+    mutate(country = ifelse(country== "United Arab Emirates (the)",
+                            "United Arab Emirates",
+                            country))|>  
+    filter(country %in% countries2use) 
+
+  covariates = NULL
+  for (sheet in seq_along(covariateset)){
+    sheetload <- readxl::read_xlsx(covariate_file,
+                                 sheet = covariateset[sheet]) |> 
+      rename("date" = "...1")
+    prefix = gsub(colnames(sheetload)[2],
+                  pattern = "_[[:alpha:]]{2}",
+                  replacement = "")  
+    sheetload  = sheetload |>  
+      select(any_of(c("date",paste(prefix,helper_table_names|> pull(alpha2), sep = "_"))))
+    
+    if(is.null(covariates)){
+      covariates = sheetload  
+    }else{
+      covariates = covariates |> full_join(sheetload, by = "date")  
+    }
+  }
+  covariates = covariates |> arrange(date) |> 
+    dplyr::filter(date >= start_date)
+  
+  
+  if(missing == "step_function"){ # take action if merited
+    if(sum(is.na(covariates))>1){ # there are at least some NA values to handle
+      # get rid of leading rows of NA values, since I need a step from which to function
+      first_non_NA_row = which(rowSums(is.na(covariates))==0)[1] 
+      if(first_non_NA_row !=1){ # check if truncation is merited for handling the first row.
+        covariates = covariates[-(1:max(first_non_NA_row-1,1)),]
+      }
+      cols_with_NAs = covariates %>% 
+        select_if(function(x) any(is.na(x))) |> colnames()
+      code = glue::glue("covariates = covariates |> 
+               mutate({cols_with_NAs} = ifelse(is.na({cols_with_NAs}),
+                                        lag({cols_with_NAs}),
+                                          {cols_with_NAs}));")
+      
+      # run it twice since I'm lazy and step function-ing from quarterly to monthly will take two pass throughs since it's vectorized
+      eval(parse(text = code))
+      eval(parse(text = code))
+    }
+  }
+  
+  # expand 2 digit iban codes into full country names 
+  for(name_fix_index in seq_len(nrow(helper_table_names))){
+      colnames(covariates) = colnames(covariates) |>
+        gsub(pattern  = paste0("_",helper_table_names$alpha2[name_fix_index]),
+             replacement  = paste0("_",helper_table_names$country[name_fix_index]))
+      }
+  
+  return(covariates)
+}
+
+# some variables might be quarterly. Just use the old variable 
 
 
 
