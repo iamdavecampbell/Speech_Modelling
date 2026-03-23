@@ -7,45 +7,12 @@ format:
     eval: true
 ---
 
-<!-- I'm not sure why but the process noise sigma_proc is sampling some negative values.  The stan file should prevent that.  -->
-
-## Assessment
-
-State Space models are much better in that they seem to catch some of the dynamics.  HMC should be a good tool, since it uses some information about the shape of the posterior.  However the parameters and states are highly correlated making them difficult to sample.
-
-
-#### Other things to try
-
-- Sequential monte carlo which gets around the complex posterior by sequentially adding one time point at each stage, then filtering and repopulating samples.
-- Sequentially constrained Monte Carlo.  Similar to SMC, but rather than adding one data point at each stage, use the full dataset at each stage, but slowly bring in the model as a constraint.
-- Approximately marginalizing over the latent states using a Laplace Approximation.  The fastest is to use the very frequentist **TMB** software as an optimizer since it all runs in c++.  Slower is to use an Integrated Nested Laplace Approximation (INLA) which facilitates a Bayesian approach focused on the marginal posterior. 
-
-
-## Basics
-
-```{r version}
-#| code-fold: true
-#| message: false
-#| warning: false
-version
-library(tidyverse)
-library(rlang)
-library(lubridate)
-library(rstan)
-library(coda) # diagnostics
-library(reshape2) # reshaping matrices
-library(bayesplot) # stan output plots in ggplot
-options(mc.cores = 4)
-rstan_options(auto_write = TRUE)
-
-source("MCMC_SS_functions.R")     # Just used for data loading
-
-```
 
 
 ## State Space Model:
 
-State space models are a generalization of time series models, where the observations are driven by an underlying stochastic transition process, but may be observed with noise.
+State space models are a generalization of time series models, where the observations are driven by an underlying stochastic transition process, but may be observed with noise.   
+We could just use a full Gaussian process model to interpolate the missing (partial) vector values and also propagate the model forward, but that tends to be very slow since the covaraince needs factorizing at every iteration.   See earlier versions of this code if you like inefficient code that converges very slowly.
 
 
 A state space formulation implies that there is some stochastic process for the mean and we observe some stochastic process.   The observation process allows for the scenario where a Bank doesn't give speeches in a given month ($\alpha = 0$) or something else comes up.  The transition process models the evolution of topic importance, whereas the observation process allows those topics to be observed with noise.  Here "with noise" implies that a central bank only gives a sample of speeches in any time period.
@@ -55,93 +22,104 @@ A state space formulation implies that there is some stochastic process for the 
 
 #### Observation process:
 
-Observed Document Term Proportion $DTP_{ijt}$, for topic $i$, country $j$ at time $t$ are modelled as noisy realizations of an underlying state process $X_{ijt}$:
 
-$$DTP_{ijt} = \alpha_{ijt} \left[X_{ijt} + e_{i,j,t}\right], \ \ \ where\ \ \ e_{ijt}\sim N(0,\sigma^2_{e,i}), \ \ \ and \ \ \ \alpha_{ijt} \{0,1\}$$
-The use of $\alpha$ allows observations to be turned on / off. 
+Let $(y_{t,k})$ denote the topic proportion for month \(t\) and country \(k\). To keep the model fast enough for routine imputation, we represent each country's latent trajectory with a first-order state-space Gaussian process,
 
+$$f_{1,k} \sim \mathcal{N}\left(\mu_k, \alpha_k^2\right),
+\qquad
+f_{t,k} \mid f_{t-1,k} \sim \mathcal{N}\left(
+\mu_k + \phi_k \left(f_{t-1,k} - \mu_k\right),
+\alpha_k^2 \left(1 - \phi_k^2\right)
+\right),$$
 
-#### Un-observable Transition process:
-
-Dropping the reliance on the topic index _i_, the model transitions ahead based on the  stochastic process: 
-
-$$X_{jt} = a_j+b_{j} * X_{jt-1} + \sum_{k\in \{1,...,J\} \setminus \{j\}}c_{jk} * X_{kt-1}+ \delta_{jt}.$$
-Using matrix notation this can be written with a $J$ by $J$ matrix $\Theta$ with diagonal elements corresponding to $b_j$ and off diagonals  $c_{jk}$, along with the $J$ by 1 vector of intercepts $A$ and vector of stochastic process noise realizations $\delta_t$:
-$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
-The use of **Multivariate Normal** with correlation $\Sigma_\delta$ vs something with independent elements is a modelling decision.  I don't think that it will interfere with estimation of $c_{jk}$.  The term $c_{jk}$ tracks how the past of country $k$ impacts the present of country $j$, whereas any correlation structure in $\Sigma_\delta$ relates more to external events that both banks are looking at when crafting speeches.
+where $(\phi_k = \exp(-1 / \rho_k)),  $(\rho_k)$ is the temporal length scale for country \(k\), and (\alpha_k)$ is the marginal scale. Marginally, this is still a Gaussian process with covariance
 
 
-The un-observable transition process _should_ track the underlying process better than a VAR model because it splits apart the states and observations.  Both will be about the same when it comes to prediction.
+$$\mathrm{Cov}\left(f_{t,k}, f_{t',k}\right)
+= \alpha_k^2 \phi_k^{|t-t'|}
+= \alpha_k^2 \exp\left(-\frac{|t-t'|}{\rho_k}\right).
+$$
 
+This ensures a coherent GP prior while avoiding repeated dense covariance factorizations. Conditional on the latent GP $f_{tk}$ values at month (t), the vector of observations across countries is
 
-Note that we already know the values of $\alpha_{jt} \in\{0,1\}$  but we will model it as $\alpha_{jt}\sim Bernoulli (p_a)$.   **In a future version**, maybe we set up $p_a$ to be time varying, allowing for topics like covid and the unprovoked invasion of Ukraine to be turned off / on.  
-When we observe zero for this topic or we do not observe a speech, then we have $\alpha_{jt}=0$ and $\alpha_{jt}=1$ otherwise.
+$$\mathbf{y}_t \mid \mathbf{f}_t \sim \mathcal{N}_K\left(\mathbf{f}_t, \Sigma\right),
+\qquad
+\Sigma = \mathrm{diag}(\boldsymbol{\sigma}) \, \Omega \, \mathrm{diag}(\boldsymbol{\sigma}),$$
 
+with correlation matrix $(\Omega)$ between the K countries, and $(\boldsymbol{\sigma})$ country-specific scales. This cross-country covariance enables missing values to be sampled as additional parameters conditional on countries observed in the same month.
 
-#### The Complete data likelihood:
+If a given month is partitioned into observed countries \(o\) and missing countries \(m\), then the model implies the Gaussian conditional distribution
 
-$$P(X_{ijt},\ldots X_{ij0},DTP_{ijt},\ldots,DTP_{ij0}\mid \Theta, p_a, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}) = P(\alpha\mid p_a)P(X_{ij0})\prod_{s=1}^t P(X_{ijs}\mid X_{ijs-1}, \Theta)P(DTP_{ijs}\mid\Theta, p_a, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i},X_{ijs})$$
+$$\mathbf{y}_{t,m} \mid \mathbf{y}_{t,o}, \mathbf{f}_t, \Sigma
+\sim
+\mathcal{N}\left(
+\mathbf{f}_{t,m} +
+\Sigma_{mo}\Sigma_{oo}^{-1}\left(\mathbf{y}_{t,o} - \mathbf{f}_{t,o}\right),
+\;
+\Sigma_{mm} - \Sigma_{mo}\Sigma_{oo}^{-1}\Sigma_{om}
+\right).$$
+This is the usual GP formulation where the mean for the missing values is updated conditional on the deviation from the mean $\mathbf{y}_{t,o} - \mathbf{f}_{t,o}$.  The Covariance for the unobserved locations, $\Sigma_{mm}$, is reduced based on the covariance between missing and observed $\Sigma_{mo}$ scaled by the variance of the observed, $\Sigma_{oo}$. Stan samples the missing entries jointly with the hyperparameters, so posterior draws of the missing values are coherent with the fitted latent process and the learned cross-country covariance structure.
 
+This update differs from a hard-truncated sparse band diagonal kernel. In Stan,  zeroing distant covariances  still leaves a dense-enough covariance matrix that it must be factorized, limiting runtime improvements. The state-space form gives the main speed gain because it scales linearly in the number of time points instead of cubically with the full covariance.
 
-#### The Observed data (marginal) likelihood:
+## Basics
 
-$$P(DTP_{ijt},\ldots,DTP_{ij0},\alpha_{jt}\mid \Theta, p_a, \sigma^2_{\epsilon}, \sigma^2_{\delta}) = \int_\chi\cdots\int_\chi P(\alpha\mid p_a)P(X_{j0})\prod_{s=1}^t P(X_{js}\mid X_{js-1} \Theta)\left[P(DTP_{js}\mid\Theta, p_a, \sigma^2_{\epsilon}, \sigma^2_{\delta},X_{js}))\right]^{\alpha_{jt}}dX_{j0}\cdots dX_{jT}$$
+Note, when running as a script, we can define `Niter`,  and the saving `filename` externally. Defaults, if not provided, are `Niter = 60000`,  and `filename = "gp_panel_results_inflat.Rdata"`.
 
-### Frequentist Approach: 
-
-We could use a Laplace Approximation to integrate out the nuissance parameters $X$ and the unobserved $DTP$ values to obtain the MLE for $\Theta, \alpha, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}$.  This becomes a numerical optimization routing where the optimizer needs to handle the Laplace approximation at each iteration until the marginal likelihood is optimized.  The R library _TMB_ compiles models in C and runs quickly if you want to try it.
-
-#### Bayesian Approach:
-
-Bayesian tools provide easy access to non-asymptotic uncertainty estimates and readily allow for unspecified correlations between parameters. Bayesian approaches also allow for non-approximate (well, less-approximate) integration for marginal likelihoods.
-
-Include priors on structural parameters $X_{ij0},\Theta, p_a, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i}$, then sample from the joint posterior of all structural parameters and the states (nuissance parameters).  Discard the samples from the nuissance parameters to marginalize / integrate them out leaving a sample from $P(X_{ij0},\Theta, \alpha, \sigma^2_{\epsilon,i}, \sigma^2_{\delta,i} \mid DTP_{ij1},...,DTP_{ijt})$.   The sampler may be inefficient and take a while to converge unless you get fancy.  Typically people use Sequential Monte Carlo, but I'm using a faster to code, slower to run Parallel Tempering sampler.  
-
-
-
-
-
-## Priors
-
-The coefficients $\theta=[a,b,c]$, process evolution noise $\sigma_{\delta}^2$ observational error, $\sigma^2_{e}$, initial unobserved process $X_{j0}$, and the probability of observation $p_a$, all need priors, of which we use these models:
-
-
-$$a,b,c\overset{iid}{\sim }N(0,1)$$
-$$\sigma_{\delta}\sim half-Normal(0,.25), \ \ with \ \ mean\ \  0.199$$
-
-$$\sigma_{e}\sim half-Normal(0,.008), \ \ with \ \ mean \ \ 0.0064$$
-
-$X_{j0} \overset{iid}{\sim }N(0,1)$$
-
+```{r version}
+#| code-fold: true
+#| message: false
+#| eval: true
+version
+library(tidyverse)
+library(rlang)
+library(lubridate)
+library(rstan)
+library(coda)
+library(reshape2)
+library(bayesplot)
+options(mc.cores = 4)
+rstan_options(auto_write = TRUE)
+source("MCMC_functions.R")
+```
 
 ## User Defined Options
 
-Note that there are some switches that a user may define here.  In this code block the user defines:
+Basic things like the location of data file (**datafolder** ) and its filename  (**datafile**).  The choice of topics (**topic_of_interest**) is another option and some suggested values are provided.   More can be obtained by running:
 
-1. the location and file containing the time series of topics.
-2. the topic of interest
-3. the countries to use
-4. The first month to use.
-5. deciding if the log or raw data should be used.
+```{r code suggestion}
+#| eval: true
+read_csv(datafile) |> pull(anchor)|> unique()
+```
 
+Countries to select can also be selected (**countries2use**) and again some options are provided.  Running Canada and the US is fastest.   The G7 countries takes around 45 minutes for 1,000 iterations.   
+
+
+Finally some other useful options include a file prefix for saving the output (**prefix**), and logical for starting the MCMC from a good place (**use_warm_start**), and either starting points from a previous run if given in (**warm_start_file**), or if left null, reasonable data driven values are selected by infilling missing values through linear interpolation and parameters from basic slice and dice of the data.  Finally the number of iterations is selected.  Using a warm start we can get away with like 5k-10k iterations, which for G7 takes ~4-8 hours to run.
 ```{r user_defined_options}
-# 1. location and filename
-datafolder = "cbspeeches-main/inst/data-misc/"
-datafile   = paste0(datafolder,"nmf-time-series-g20.csv")
+#| eval: true
+datafolder <- "./"
+datafile <- paste0(datafolder, "nmf-time-series-g20.csv")
 
-#2. topic of interest
-candidate_topics = c("inflat" ,"brexit", "covid", "cbdc", "ukrain" )
-topic_of_interest = candidate_topics[3]
+candidate_topics  <- c("inflat" ,"brexit", "covid", "cbdc", "ukrain" )
+topic_of_interest <- candidate_topics[1]
 
-#3 countries to use.  
-# possible option
-G7_countries = c ("Canada", "France", "Germany", "Italy", "Japan",  "United Kingdom","United States")
-# possible option
-CUSA = c ("Canada","United States")
-# actual decision:
-countries2use = G7_countries# unique(dataset$country)
+G7_countries <- c(
+  "Canada",
+  "France",
+  "Germany",
+  "Italy",
+  "Japan",
+  "United Kingdom",
+  "United States"
+)
+CanUS <- c(
+  "Canada",
+  "United States"
+)
 
-#4 first month to use, 
+countries2use <- G7_countries
+
 # start of dataset
 start_date = ymd("2008-11-01")
 # otherwise the month before the first mention in the dataset.
@@ -158,2794 +136,852 @@ if(topic_of_interest=="ukrain"){
   start_date = ymd("2014-03-01")
 }
 
-#5  prefix for naming output filenames
-prefix = "stan_" 
-
+prefix <- "codex_gp_"
+use_warm_start <- TRUE
+warm_start_file <- NULL
+Niter <- 5000
 ```
 
 
 
+## Data Loading
 
-## Data Loading:
 
-
+From here it's all automated.   Data loading is handled using a helper function.   May as well make a plot of the data while we're here.
 ```{r dataload}
-#| warning: false
+#| eval: true
+data_full <- dataload(datafile, topic_of_interest, countries2use, start_date)
+dates_in_use <- data_full$dates_in_use
+data <- data_full$data
+country_names <- colnames(data)
 
-#. just loading and maybe transforming the data:
-data_full = dataload(datafile, topic_of_interest, countries2use, start_date)
-dates_in_use = data_full$dates_in_use
-if(prefix == "log"){
-  data         = log(data_full$data)
-}else{
-  data = data_full$data
-}
+matplot(
+  x = dates_in_use,
+  y = data,
+  type = "l",
+  lty = 1,
+  main = topic_of_interest,
+  ylab = "Topic Proportion",
+  xlab = "Date"
+)
+legend(
+  "topright",
+  legend = country_names,
+  col = seq_along(countries2use),
+  lty = 1,
+  cex = 0.7,
+  bty = "n"
+)
 ```
 
+## Stan Model
 
+Here's the guts of the model, coded in stan.   All is written out here and then saved as a **.stan** file.  
 
+```{r stan_model}
+#| code-fold: true
+stan_file <- "stan_gp_panel_missing.stan"
 
+stan_code <- '
+data {
+  int<lower=1> T;
+  int<lower=1> K;
+  int<lower=0> N_obs;
+  array[N_obs] int<lower=1, upper=T> obs_t;
+  array[N_obs] int<lower=1, upper=K> obs_k;
+  vector[N_obs] y_obs;
+  int<lower=0> N_mis;
+  array[N_mis] int<lower=1, upper=T> mis_t;
+  array[N_mis] int<lower=1, upper=K> mis_k;
+}
 
+parameters {
+  vector[K] mu;
+  vector<lower=0>[K] alpha;
+  vector<lower=0>[K] rho;
+  matrix[T, K] z;
+  vector<lower=0>[K] sigma_country;
+  cholesky_factor_corr[K] L_Omega;
+  vector<lower=0>[N_mis] y_mis;
+}
 
-## MCMC 
+transformed parameters {
+  matrix[T, K] f;
+  matrix[T, K] y_complete;
+  matrix[K, K] L_Sigma;
+  vector<lower=0, upper=1>[K] phi;
 
+  L_Sigma = diag_pre_multiply(sigma_country, L_Omega);
+  y_complete = rep_matrix(0.0, T, K);
+  for (k in 1:K) {
+    phi[k] = exp(-1 / rho[k]);
+  }
 
+  for (n in 1:N_obs) {
+    y_complete[obs_t[n], obs_k[n]] = y_obs[n];
+  }
+  for (n in 1:N_mis) {
+    y_complete[mis_t[n], mis_k[n]] = y_mis[n];
+  }
 
-Set up the iterations, transition variances and frequency of tuning thereof, temperatures for running the tempering.
+  for (k in 1:K) {
+    f[1, k] = mu[k] + alpha[k] * z[1, k];
+    for (t in 2:T) {
+      f[t, k] = mu[k]
+        + phi[k] * (f[t - 1, k] - mu[k])
+        + alpha[k] * sqrt(1 - square(phi[k])) * z[t, k];
+    }
+  }
+}
+
+model {
+  mu ~ normal(0.02, 0.05);
+  alpha ~ normal(0, 0.05);
+  rho ~ lognormal(log(18), 0.75);
+  sigma_country ~ normal(0, 0.05);
+  L_Omega ~ lkj_corr_cholesky(2);
+  to_vector(z) ~ std_normal();
+
+  for (t in 1:T) {
+    vector[K] y_t;
+    vector[K] f_t;
+    for (k in 1:K) {
+      y_t[k] = y_complete[t, k];
+      f_t[k] = f[t, k];
+    }
+    y_t ~ multi_normal_cholesky(f_t, L_Sigma);
+  }
+}
+
+generated quantities {
+  corr_matrix[K] Omega;
+  cov_matrix[K] Sigma_country;
+
+  Omega = multiply_lower_tri_self_transpose(L_Omega);
+  Sigma_country = quad_form_diag(Omega, sigma_country);
+}
+'
+
+writeLines(stan_code, stan_file)
+cat("Wrote Stan program to", stan_file, "\n")
+```
+
+## Prepare For Stan
+
+This is mainly helper functions to deal with finding a strong starting point and passing data to stan as a list.
+
 
 ```{r preamble}
-#| code-fold: false
-niter = 60000     # total number of iterations
+#| code-fold: true
+#| eval: true
+# if (!exists("Niter")) {
+#   Niter <- 60000
+# }
+# if (!exists("seed")) {
+#   seed <- 1234567890
+# }
+if (!exists("chains")) {
+  chains <- 2
+}
+if (!exists("filename")) {
+  filename <- paste0(
+    prefix,
+    "codex_GP_",
+    topic_of_interest,
+    "_results_",
+    paste0(countries2use, collapse = "_"),
+    "_",
+    Niter,
+    ".Rdata"
+  )
+}
 
+if (isTRUE(use_warm_start) && is.null(warm_start_file) && file.exists(filename)) {
+  warm_start_file <- filename
+}
+
+data_for_model <- data
+missing_mask <- is.na(data_for_model) | data_for_model == 0
+observed_mask <- !missing_mask
+
+obs_idx <- which(observed_mask, arr.ind = TRUE)
+mis_idx <- which(missing_mask, arr.ind = TRUE)
+
+stan_data <- list(
+  T = nrow(data_for_model),
+  K = ncol(data_for_model),
+  N_obs = nrow(obs_idx),
+  obs_t = if (nrow(obs_idx) > 0) obs_idx[, 1] else integer(0),
+  obs_k = if (nrow(obs_idx) > 0) obs_idx[, 2] else integer(0),
+  y_obs = if (nrow(obs_idx) > 0) data_for_model[observed_mask] else numeric(0),
+  N_mis = nrow(mis_idx),
+  mis_t = if (nrow(mis_idx) > 0) mis_idx[, 1] else integer(0),
+  mis_k = if (nrow(mis_idx) > 0) mis_idx[, 2] else integer(0)
+)
+
+cat("Observed values:", stan_data$N_obs, "\n")
+cat("Missing values to impute:", stan_data$N_mis, "\n")
+cat("Results file:", filename, "\n")
+cat(
+  "Warm start source:",
+  if (isTRUE(use_warm_start)) {
+    if (is.null(warm_start_file)) "data-driven initialization" else warm_start_file
+  } else {
+    "disabled"
+  },
+  "\n"
+)
+
+fill_missing_panel <- function(x) {
+  x_filled <- x
+  fallback_value <- median(x[!is.na(x) & x > 0], na.rm = TRUE)
+  if (!is.finite(fallback_value)) {
+    fallback_value <- 0.02
+  }
+
+  for (k in seq_len(ncol(x_filled))) {
+    observed <- which(!is.na(x_filled[, k]) & x_filled[, k] > 0)
+
+    if (length(observed) == 0) {
+      x_filled[, k] <- fallback_value
+    } else if (length(observed) == 1) {
+      x_filled[, k] <- x_filled[observed, k]
+    } else {
+      x_filled[, k] <- approx(
+        x = observed,
+        y = x_filled[observed, k],
+        xout = seq_len(nrow(x_filled)),
+        method = "linear",
+        rule = 2
+      )$y
+    }
+  }
+
+  x_filled
+}
+
+build_data_warm_init <- function(data_for_model, missing_mask, stan_data) {
+  filled <- fill_missing_panel(data_for_model)
+  T <- nrow(filled)
+  K <- ncol(filled)
+  mu_init <- colMeans(filled)
+  alpha_init <- pmax(apply(filled, 2, sd), 0.01)
+  phi_init <- rep(0.95, K)
+
+  for (k in seq_len(K)) {
+    centered <- filled[, k] - mu_init[k]
+    lagged <- centered[-T]
+    current <- centered[-1]
+    denom <- sum(lagged^2)
+
+    if (is.finite(denom) && denom > 1e-10) {
+      phi_raw <- sum(lagged * current) / denom
+      phi_init[k] <- min(max(phi_raw, 0.80), 0.995)
+    }
+  }
+
+  rho_init <- pmax(-1 / log(phi_init), 0.5)
+  innovation_scale <- alpha_init * sqrt(pmax(1 - phi_init^2, 1e-6))
+  z_init <- matrix(0, nrow = T, ncol = K)
+
+  for (k in seq_len(K)) {
+    z_init[1, k] <- (filled[1, k] - mu_init[k]) / alpha_init[k]
+    for (t in 2:T) {
+      z_init[t, k] <- (
+        filled[t, k] -
+          mu_init[k] -
+          phi_init[k] * (filled[t - 1, k] - mu_init[k])
+      ) / innovation_scale[k]
+    }
+  }
+
+  y_mis_init <- if (stan_data$N_mis > 0) {
+    pmax(filled[missing_mask], 1e-6)
+  } else {
+    numeric(0)
+  }
+
+  list(
+    mu = mu_init,
+    alpha = alpha_init,
+    rho = rho_init,
+    z = z_init,
+    sigma_country = pmax(alpha_init * 0.25, 0.01),
+    L_Omega = diag(K),
+    y_mis = y_mis_init
+  )
+}
+
+load_saved_fit <- function(path) {
+  file_ext <- tolower(tools::file_ext(path))
+
+  if (file_ext == "rds") {
+    fit_obj <- readRDS(path)
+  } else {
+    fit_env <- new.env(parent = emptyenv())
+    loaded_names <- load(path, envir = fit_env)
+    stanfit_names <- loaded_names[
+      vapply(
+        loaded_names,
+        function(nm) inherits(fit_env[[nm]], "stanfit"),
+        logical(1)
+      )
+    ]
+
+    if (length(stanfit_names) == 0) {
+      stop("No stanfit object found in ", path)
+    }
+    fit_obj <- fit_env[[stanfit_names[1]]]
+  }
+
+  if (!inherits(fit_obj, "stanfit")) {
+    stop(path, " does not contain a stanfit object.")
+  }
+
+  fit_obj
+}
+
+build_fit_warm_init <- function(path, stan_data, data_for_model, missing_mask) {
+  fit_obj <- load_saved_fit(path)
+  draws <- rstan::extract(
+    fit_obj,
+    pars = c("mu", "alpha", "rho", "z", "sigma_country", "L_Omega", "y_mis")
+  )
+  required_pars <- c("mu", "alpha", "rho", "z", "sigma_country", "L_Omega")
+
+  missing_required <- setdiff(required_pars, names(draws))
+  if (length(missing_required) > 0) {
+    stop(
+      "Warm start fit is missing required parameters: ",
+      paste(missing_required, collapse = ", ")
+    )
+  }
+
+  n_draws <- dim(draws$mu)[1]
+  draw_id <- n_draws
+  fallback_init <- build_data_warm_init(data_for_model, missing_mask, stan_data)
+
+  if (
+    length(draws$mu[draw_id, ]) != stan_data$K ||
+      ncol(draws$z[draw_id, , ]) != stan_data$K ||
+      nrow(draws$z[draw_id, , ]) != stan_data$T
+  ) {
+    stop("Warm start fit dimensions do not match the current panel.")
+  }
+
+  y_mis_init <- fallback_init$y_mis
+  if (stan_data$N_mis > 0 && "y_mis" %in% names(draws)) {
+    if (length(draws$y_mis[draw_id, ]) == stan_data$N_mis) {
+      y_mis_init <- pmax(draws$y_mis[draw_id, ], 1e-6)
+    }
+  }
+
+  list(
+    mu = as.numeric(draws$mu[draw_id, ]),
+    alpha = pmax(as.numeric(draws$alpha[draw_id, ]), 1e-4),
+    rho = pmax(as.numeric(draws$rho[draw_id, ]), 0.1),
+    z = draws$z[draw_id, , ],
+    sigma_country = pmax(as.numeric(draws$sigma_country[draw_id, ]), 1e-4),
+    L_Omega = draws$L_Omega[draw_id, , ],
+    y_mis = y_mis_init
+  )
+}
+
+jitter_warm_init <- function(init_list, chain_id) {
+  jitter_scale <- 0.02 * chain_id
+
+  list(
+    mu = init_list$mu + rnorm(length(init_list$mu), 0, 0.01 + jitter_scale / 2),
+    alpha = pmax(
+      init_list$alpha * exp(rnorm(length(init_list$alpha), 0, jitter_scale)),
+      1e-4
+    ),
+    rho = pmax(
+      init_list$rho * exp(rnorm(length(init_list$rho), 0, jitter_scale)),
+      0.1
+    ),
+    z = init_list$z + matrix(
+      rnorm(length(init_list$z), 0, 0.05 + jitter_scale),
+      nrow = nrow(init_list$z),
+      ncol = ncol(init_list$z)
+    ),
+    sigma_country = pmax(
+      init_list$sigma_country * exp(
+        rnorm(length(init_list$sigma_country), 0, jitter_scale)
+      ),
+      1e-4
+    ),
+    L_Omega = init_list$L_Omega,
+    y_mis = pmax(
+      init_list$y_mis * exp(rnorm(length(init_list$y_mis), 0, jitter_scale)),
+      1e-6
+    )
+  )
+}
+
+make_init_function <- function(
+  use_warm_start,
+  warm_start_file,
+  data_for_model,
+  missing_mask,
+  stan_data
+) {
+  if (!isTRUE(use_warm_start)) {
+    return("random")
+  }
+
+  base_init <- NULL
+
+  if (!is.null(warm_start_file) && file.exists(warm_start_file)) {
+    base_init <- tryCatch(
+      build_fit_warm_init(
+        path = warm_start_file,
+        stan_data = stan_data,
+        data_for_model = data_for_model,
+        missing_mask = missing_mask
+      ),
+      error = function(e) {
+        message("Warm start from file failed: ", conditionMessage(e))
+        NULL
+      }
+    )
+  }
+
+  if (is.null(base_init)) {
+    base_init <- build_data_warm_init(data_for_model, missing_mask, stan_data)
+    message("Using data-driven warm start.")
+  } else {
+    message("Using posterior warm start from ", warm_start_file)
+  }
+
+  function(chain_id = 1) {
+    jitter_warm_init(base_init, chain_id)
+  }
+}
+
+init_fun <- make_init_function(
+  use_warm_start = use_warm_start,
+  warm_start_file = warm_start_file,
+  data_for_model = data_for_model,
+  missing_mask = missing_mask,
+  stan_data = stan_data
+)
 ```
 
-Run the MCMC using **stan**.  Stan uses a no u-turn variant of _Hamiltonian Monte Carlo_, so this _should_ be more efficient than Metropolis Hastings.
+## Run MCMC via Stan
 
+Stan uses the NUTS variant of Hamiltonian Monte Carlo. With this formulation, it's quite efficient, yet still slow since each of the **k** countries need their own missing values and covariances.
 
 ```{r MCMC}
 #| code-fold: true
 #| eval: false
+T1 <- Sys.time()
 
-
-filename = paste0(prefix,"dataSS_",topic_of_interest,"_results_",paste0(countries2use, collapse = "_"),"_",niter,".Rdata")
-print(filename)
-
-
-T1 = Sys.time()
-
-# Set up the data so that NAs and zeros are treated the same way.
-data[is.na(data)] = 0
-colnames(data) = NULL
-
-# Prepare list for Stan
-stan_data <- list(
-  T = nrow(data),
-  K = ncol(data),
-  I = diag(ncol(data)),
-  y_obs = data
-)
-
-# Compile and run
 fit <- stan(
-  file = "state_space.stan",
+  file = stan_file,
   data = stan_data,
-  iter = niter, 
-  init = "vb",
-  warmup = niter/2,
-  chains = 4,
+  init = init_fun,
+  iter = Niter,
+  warmup = floor(Niter / 2),
+  chains = chains,
+  # seed = seed, # i don't generally like using a fixed seed, since then it is just a deterministic process.
   algorithm = "NUTS",
-  control = list(adapt_delta   = .99,
-                 max_treedepth = 30)
+  refresh = max(1, floor(Niter / 20)),
+  control = list(
+    adapt_delta = 0.95,
+    max_treedepth = 12
+  )
 )
 
-# Summarize results
-print(fit, pars = c("theta"))
-
-
-elapsed = Sys.time() - T1 
-cat(paste("total compute time: ", round(as.numeric(elapsed, units = "hours"),2)," hours."))
-save.image(filename)
-
-
+elapsed <- Sys.time() - T1
+cat(
+  paste(
+    "total compute time:",
+    round(as.numeric(elapsed, units = "hours"), 2),
+    "hours.\n"
+  )
+)
+# save.image("5k iters.Rdata")
 ```
 
-
-## Make some plots:
-
-In all cases discard the part of the MCMC where chains were being adapted.
+## Posterior Summaries
 
 
-
-:::: panel-tabset
-
-```{r, cache = TRUE}
-#| echo: false
-topic_index_for_sections = 0
-topic_index_for_sections = topic_index_for_sections+1
-topic_of_interest = candidate_topics[topic_index_for_sections]
-candidate_files_to_load = list.files(pattern = paste0("stan_2chain_dataSS_",topic_of_interest,"_results_Canada_France_Germany_Italy_Japan_United Kingdom_United States_60000"))
-```
-
-## Topic `r topic_of_interest`
-
-
-Results loop over the topics of interest and rely on having run the above code set across different topics.
-
-```{r chunk274}
+```{r data_load_for_rendering}
 #| code-fold: true
-runtime = filesloaded = iters_run  =  rep(NA, length(candidate_files_to_load))
+#| eval: true
 
-# clunky and lazy way to get at the number of time steps for this topic
-filename = candidate_files_to_load[1]
-load(filename)
-niter = 60000
-parnames = names(fit)
+# load some data if it exists.
+# this is useful if you want to render this document.  It'll load the appropriate filename and go from there.
 
-# collect the names of parameters
-
-A_index             = parnames  |> grep(pattern = "^A")
-theta_index         = parnames  |> grep(pattern = "theta")
-sigma_obs_index     = parnames  |> grep(pattern = "sigma_obs")   
-sigma_proc_index    = parnames  |> grep(pattern = "sigma_proc")
-# Note that L_corr is the lower triangle cholesky decomposition of the correlation matrix so that the diagonals and upper triangle elements will be all zeros and are not sampled.
-L_corr_index = NULL
-for(rows in 2:length(A_index)){
-  for(cols in 1:(rows-1)){
-    L_corr_index = c(L_corr_index,
-                     grep(parnames , pattern = paste0("L_corr\\[",rows,",",cols)))
-  }
-}
-L_proc_index        = parnames  |> grep(pattern = "L_proc")
-lp__index           = parnames  |> grep(pattern = "lp__")
-X_index             = parnames  |> grep(pattern = "^X")
-
-# collect the sampled parameters
-# dimensions are: iterations, chains, parameters
-fittedA          = array(NA, dim = c(niter,length(candidate_files_to_load),length(A_index)))
-fittedtheta      = array(NA, dim = c(niter,length(candidate_files_to_load),length(theta_index)))
-fittedsigma_obs  = array(NA, dim = c(niter,length(candidate_files_to_load),length(sigma_obs_index)))
-fittedsigma_proc = array(NA, dim = c(niter,length(candidate_files_to_load),length(sigma_proc_index)))
-fittedLcorr      = array(NA, dim = c(niter,length(candidate_files_to_load),length(L_corr_index)))
-fittedLproc      = array(NA, dim = c(niter,length(candidate_files_to_load),length(L_proc_index)))
-fittedlp__       = array(NA, dim = c(niter,length(candidate_files_to_load),length(lp__index)))
-fittedX          = array(NA, dim = c(niter,length(candidate_files_to_load),length(X_index)))
-
-
-for(lp in 1:length(candidate_files_to_load)){
-  filename = candidate_files_to_load[lp]
+if(filename %in% list.files( pattern = filename)){
   load(filename)
-  runtime[lp]      = as.numeric(elapsed, units = "hours")
-  filesloaded[lp]  = filename 
-  iters_run[lp]    = niter
-  
-  fittedA[,lp,]          = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[A_index])
-  fittedtheta[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[theta_index])
-  fittedsigma_obs[,lp,]  = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[sigma_obs_index])
-  fittedsigma_proc[,lp,] = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[sigma_proc_index])
-  fittedLcorr[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[L_corr_index])
-  fittedLproc[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[L_proc_index])
-  fittedlp__[,lp,]       = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[lp__index])
-  fittedX[,lp,]          = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[X_index])
-  
 }
 
 ```
 
-Diagnostics:
-
-Total compute time: `r round(runtime,2)` hours.
-
-As a sanity check, just make sure that all of the median log posteriors  are pretty close to each other.  If a subset are more than like 2% worse than others, consider if they are sampling from different places and/or should be discarded.
-
-```{r}
-#| cache: true
-
-burnin = 30000 # half the iterations
-niter = 60000
-apply(fittedlp__[-c(1:burnin),,],2,median)
-
-```
 
 
-
-Consider the Gelman-Rubin Diagnostics to see if the within chain variability is similar to the between chain variability.
-
-Make a mega matrix, but also consider little pieces later for diagnostics:
-
-```{r}
+```{r posterior_summaries}
+#| eval: true
 #| code-fold: true
+fit_summary <- summary(
+  fit,
+  pars = c("mu", "alpha", "rho", "sigma_country")
+)$summary |>
+  as_tibble(rownames = "parameter")
 
-# reconstruct the mattrices to be easier to plot
-# then slap on some names
-combo_fittedA_mat           = cbind(matrix(aperm(fittedA[-c(1:burnin), , ],            c(1, 2, 3)),nrow = dim(fittedA)[1]*dim(fittedA)[2],                   ncol = dim(fittedA)[3]),          iter = rep((1+burnin):niter, dim(fittedA)[2]),         chain = rep(1:dim(fittedA)[2],           each = burnin)); colnames(combo_fittedA_mat)            = c(parnames[A_index], "iter",  "chain")
-combo_fittedtheta_mat       = cbind(matrix(aperm(fittedtheta[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedtheta)[1]*dim(fittedtheta)[2],           ncol = dim(fittedtheta)[3]),      iter = rep((1+burnin):niter, dim(fittedtheta)[2]),     chain = rep(1:dim(fittedtheta)[2],       each = burnin)); colnames(combo_fittedtheta_mat)            = c(parnames[theta_index], "iter",  "chain")
-combo_fittedsigma_obs_mat   = cbind(matrix(aperm(fittedsigma_obs[-c(1:burnin), , ],    c(1, 2   )),nrow = dim(fittedsigma_obs)[1]*dim(fittedsigma_obs)[2],   ncol = dim(fittedsigma_obs)[3]),  iter = rep((1+burnin):niter, dim(fittedsigma_obs)[2]), chain = rep(1:dim(fittedsigma_obs)[2],   each = burnin)); colnames(combo_fittedsigma_obs_mat)            = c(parnames[sigma_obs_index], "iter",  "chain")
-combo_fittedsigma_proc_mat  = cbind(matrix(aperm(fittedsigma_proc[-c(1:burnin), , ],   c(1, 2, 3)),nrow = dim(fittedsigma_proc)[1]*dim(fittedsigma_proc)[2], ncol = dim(fittedsigma_proc)[3]), iter = rep((1+burnin):niter, dim(fittedsigma_proc)[2]),chain = rep(1:dim(fittedsigma_proc)[2],  each = burnin)); colnames(combo_fittedsigma_proc_mat)            = c(parnames[sigma_proc_index], "iter",  "chain")
-combo_fittedLcorr_mat       = cbind(matrix(aperm(fittedLcorr[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedLcorr)[1]*dim(fittedLcorr)[2],           ncol = dim(fittedLcorr)[3]),      iter = rep((1+burnin):niter, dim(fittedLcorr)[2]),     chain = rep(1:dim(fittedLcorr)[2],       each = burnin)); colnames(combo_fittedLcorr_mat)            = c(parnames[L_corr_index], "iter",  "chain")
-combo_fittedLproc_mat       = cbind(matrix(aperm(fittedLproc[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedLproc)[1]*dim(fittedLproc)[2],           ncol = dim(fittedLproc)[3]),      iter = rep((1+burnin):niter, dim(fittedLproc)[2]),     chain = rep(1:dim(fittedLproc)[2],       each = burnin)); colnames(combo_fittedLproc_mat)            = c(parnames[L_proc_index], "iter",  "chain")
-combo_fittedlp___mat        = cbind(matrix(aperm(fittedlp__[-c(1:burnin), , ],         c(1, 2   )),nrow = dim(fittedlp__)[1]*dim(fittedlp__)[2],             ncol = dim(fittedlp__)[3]),       iter = rep((1+burnin):niter, dim(fittedlp__)[2]),      chain = rep(1:dim(fittedlp__)[2],        each = burnin)); colnames(combo_fittedlp___mat)            = c(parnames[lp__index], "iter",  "chain")
-combo_fittedX_mat           = cbind(matrix(aperm(fittedX[-c(1:burnin), , ],            c(1, 2, 3)),nrow = dim(fittedX)[1]*dim(fittedX)[2],                   ncol = dim(fittedX)[3]),          iter = rep((1+burnin):niter, dim(fittedX)[2]),         chain = rep(1:dim(fittedX)[2],           each = burnin)); colnames(combo_fittedX_mat)            = c(parnames[X_index], "iter",  "chain")
+print(fit_summary)
 
-```
+if (stan_data$N_mis > 0) {
+  mis_pars <- paste0("y_mis[", seq_len(stan_data$N_mis), "]")
+  mis_summary <- summary(fit, pars = mis_pars)$summary |>
+    as_tibble(rownames = "parameter") |>
+    mutate(
+      date = dates_in_use[stan_data$mis_t],
+      country = country_names[stan_data$mis_k]
+    ) |>
+    dplyr::select(
+      date,
+      country,
+      mean,
+      sd,
+      `2.5%`,
+      `25%`,
+      `50%`,
+      `75%`,
+      `97.5%`,
+      n_eff,
+      Rhat
+    )
 
+  print(mis_summary, n = min(25, nrow(mis_summary)))
 
-::: {.callout-note collapse=true title="log posterior trace"}
-```{r}
-# do some thinning to make the traceplots plots faster
-combo_fittedlp___mat[seq(1,nrow(combo_fittedlp___mat),by = 10),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .8)
+  posterior_mean_matrix <- data_for_model
+  posterior_mean_matrix[missing_mask] <- mis_summary$mean
 
+  posterior_plot_df <- posterior_mean_matrix |>
+    as.data.frame() |>
+    setNames(country_names) |>
+    mutate(date = dates_in_use) |>
+    pivot_longer(
+      cols = all_of(country_names),
+      names_to = "country",
+      values_to = "posterior_mean"
+    )
 
-```
+  imputed_plot_df <- mis_summary |>
+    rename(
+      lower_95 = `2.5%`,
+      median_value = `50%`,
+      upper_95 = `97.5%`
+    )
 
-:::
-
-
-::: {.callout-note collapse=true title="log posterior trace"}
-```{r}
-# do some thinning to make the traceplots plots faster
-combo_fittedlp___mat[seq(1,nrow(combo_fittedlp___mat),by = 10),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .8)
-
-
-```
-
-:::
-
-::: {.callout-note collapse=true title="A"}
-
-
-
-
-
-
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedA)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedA[-c(1:burnin),i,])
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedA_mat[seq(1,nrow(combo_fittedA_mat), by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    parameter = str_replace_all(parameter,
-                                pattern = paste0("A\\[",country),
-                                replacement = paste0("A\\[",countries2use[country])))
+  ggplot() +
+    geom_linerange(
+      data = imputed_plot_df,
+      aes(ymin = lower_95, ymax = upper_95, x = date, color = country, group = country),
+      linewidth = 0.5,
+      alpha = 0.5,
+      show.legend = FALSE
+    ) +
+    geom_point(
+      data = imputed_plot_df,
+      aes(y = mean, x = date, color = country, group = country),
+      shape = 21,
+      fill = "white",
+      stroke = 0.9,
+      size = 2.2,
+      show.legend = FALSE
+    ) +
+    geom_line(
+      data = posterior_plot_df,
+      aes(x = date, y = posterior_mean, color = country, group = country),
+      linewidth = 0.8, alpha = 0.9) +
+    labs(
+      title = paste(topic_of_interest, "with posterior mean imputations"),
+      subtitle = "Imputed points are marked with 95% posterior intervals",
+      x = "Date",
+      y = "Topic Proportion",
+      color = "Country"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "right",
+      panel.grid.minor = element_blank()
+    )
 }
-stacked |>   ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-
-
-
-
-# do some light thinning to make the density plots faster
-stacked = combo_fittedA_mat[seq(1,nrow(combo_fittedA_mat), by = 5),] |>
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    parameter = str_replace_all(parameter,
-                                pattern = paste0("A\\[",country),
-                                replacement = paste0("A\\[",countries2use[country])))
-}
-
-stacked|>   ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  facet_wrap(~parameter, scales = "free")
-
-
-```
-:::
-
-::: {.callout-note collapse=true title="theta"}
-
-```{r}
-
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedtheta)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedtheta[-c(1:burnin),i,])
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-
-gelman.diag(mclist)
-
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedtheta_mat[seq(1,nrow(combo_fittedtheta_mat), by = 100),] |>  
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-
-stacked |>   ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-# do some light thinning to make the density plots faster
-combo_fittedtheta_mat[seq(1,nrow(combo_fittedtheta_mat), by = 5),] |>  
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  geom_vline(xintercept = 0)+
-  facet_wrap(~parameter, scales = "free_y")
-
-```
-
-:::
-
-
-::: {.callout-note collapse=true title="observational noise"}
-
-The $\sigma_{\e}$ aka sigma\_obs, the observational noise:
-
-
-
-```{r}
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedsigma_obs)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedsigma_obs[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-combo_fittedsigma_obs_mat[seq(1,nrow(combo_fittedsigma_obs_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-combo_fittedsigma_obs_mat[seq(1,nrow(combo_fittedsigma_obs_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()
-
-
-
-```
-:::
-
-
-
-::: {.callout-note collapse=true title="process noise"}
-
-The $\sigma_{\delta}$ aka sigma\_proc.  These are the diagonal elements of the process noise.
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedsigma_proc)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedsigma_proc[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedsigma_proc_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    par = str_replace_all(parameter,
-                          pattern = paste0("sigma_proc\\[",country),
-                          replacement = paste0("sigma_proc\\[",countries2use[country])))
-}
-stacked |>   
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-stacked = combo_fittedsigma_proc_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    par = str_replace_all(parameter,
-                          pattern = paste0("sigma_proc\\[",country),
-                          replacement = paste0("sigma_proc\\[",countries2use[country])))
-}
-
-stacked|>   ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  facet_wrap(~parameter, scales = "free")
-
-
-
-
-```
-
-:::
-
-
-
-
-::: {.callout-note collapse=true title="process noise matrix"}
-Elements of the correlation matrix from the Cholesky factorization that is used in stan:
-
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedLcorr)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedLcorr[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-combo_fittedLcorr_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample") |>   
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  geom_hline(yintercept = 0)+
-  facet_wrap(~parameter)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-combo_fittedLcorr_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample") |>   
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  geom_vline(xintercept = 0)+
-  facet_wrap(~parameter, scales = "free")
-  
-  
 ```
 
 
 
 
-Take a closer look at the correlation structure of the process noise.  These are the lements of $\Sigma_\delta$ in the process evolution:
+### Plot some basic disgnostics such as traceplots:
 
-$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
 
-```{r}
-#| cache: true
+```{r traceplots}
+#| eval: true
 #| code-fold: true
+plot(extract(fit, "lp__")[[1]],
+     ylab = "un-normalized log posterior")
 
 
-##### Just go right after L_proc.  It's lower triangle since it's used as 
-# a cholesky decomp of the full covariance (and correlation) in the normal transitions
+matplot(extract(fit, "mu")[[1]], type = 'l', main = "mu")
+pairs(extract(fit, "mu")[[1]], main = "mu")
+
+pairs(extract(fit, "rho")[[1]], main = "rho")
 
 
-meanies <- lapply(1:dim(fittedLproc)[3], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mean(fittedLproc[-c(1:burnin), , i]) 
-})
-meanies = unlist(meanies)
-names(meanies) = parnames[L_proc_index]
+pairs(extract(fit, "alpha")[[1]], main = "alpha")
 
-L_proc_mean_mat = matrix(0, nrow = length(countries2use), ncol =  length(countries2use))
-for(rows in 1:length(countries2use)){
-  for(cols in 1:(rows)){
-    L_proc_mean_mat[rows,cols] = meanies[paste0("L_proc[",rows,",",cols,"]")]
+```
+
+
+
+### Show data fit
+
+```{r show_data_fit}
+#| eval: true
+#| code-fold: true
+fitted_mean_matrix <- data_for_model
+if (exists("mis_summary")) {
+  fitted_mean_matrix[missing_mask] <- mis_summary$mean
+}
+
+f_draws <- rstan::extract(fit, pars = "f")$f
+fitted_lower_matrix <- apply(f_draws, c(2, 3), quantile, probs = 0.025)
+fitted_upper_matrix <- apply(f_draws, c(2, 3), quantile, probs = 0.975)
+
+fitted_plot_df <- fitted_mean_matrix |>
+  as.data.frame() |>
+  setNames(country_names) |>
+  mutate(date = dates_in_use) |>
+  pivot_longer(
+    cols = all_of(country_names),
+    names_to = "country",
+    values_to = "fitted_mean"
+  )
+
+fitted_interval_df <- tibble(
+  date = rep(dates_in_use, times = length(country_names)),
+  country = rep(country_names, each = length(dates_in_use)),
+  fitted_lower_95 = as.vector(fitted_lower_matrix),
+  fitted_upper_95 = as.vector(fitted_upper_matrix)
+)
+
+observed_plot_df <- data_for_model |>
+  as.data.frame() |>
+  setNames(country_names) |>
+  mutate(date = dates_in_use) |>
+  pivot_longer(
+    cols = all_of(country_names),
+    names_to = "country",
+    values_to = "observed_value"
+  ) |>
+  filter(!is.na(observed_value), observed_value != 0) |>
+  mutate(
+    t_index = match(date, dates_in_use),
+    k_index = match(country, country_names)
+  ) |>
+  rowwise() |>
+  mutate(
+    fitted_lower_95 = quantile(f_draws[, t_index, k_index], 0.025),
+    fitted_median = median(f_draws[, t_index, k_index]),
+    fitted_upper_95 = quantile(f_draws[, t_index, k_index], 0.975)
+  ) |>
+  ungroup()
+
+ggplot() +
+  geom_ribbon(
+    data = fitted_interval_df,
+    aes(
+      x = date,
+      ymin = fitted_lower_95,
+      ymax = fitted_upper_95,
+      group = country
+    ),
+    alpha = 0.2,
+    fill = "black",
+    color = "black",
+    show.legend = FALSE
+  ) +
+  geom_line(
+    data = fitted_plot_df,
+    aes(x = date, y = fitted_mean, color = country, group = country),
+    linewidth = 0.9,
+    alpha = 0.9
+  ) +
+  # geom_linerange(
+  #   data = observed_plot_df,
+  #   aes(
+  #     x = date,
+  #     ymin = fitted_lower_95,
+  #     ymax = fitted_upper_95,
+  #     color = country
+  #   ),
+  #   linewidth = 0.5,
+  #   alpha = 0.45,
+  #   show.legend = FALSE
+  # ) +
+  geom_point(
+    data = observed_plot_df,
+    aes(x = date, y = observed_value, color = country),
+    size = 1.3,
+    alpha = 0.75
+  ) +
+  geom_line(
+    data = observed_plot_df,
+    aes(x = date, y = fitted_median),
+    colour = "black",
+    size = 1.8,
+    show.legend = FALSE
+  ) +
+  labs(
+    title = paste(topic_of_interest, "model fit to observed data"),
+    subtitle = paste(
+      "Lines show fitted posterior means;",
+      "observed points are overlaid with 95% fitted intervals"
+    ),
+    x = "Date",
+    y = "Topic Proportion",
+    color = "Country"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )+
+  facet_wrap(~country)
+```
+
+
+
+
+## Correlation matrix Omega
+
+```{r omega_plots}
+#| eval: true
+#| code-fold: true
+omega_draws <- rstan::extract(fit, pars = "Omega")$Omega
+
+omega_median <- apply(omega_draws, c(2, 3), median)
+omega_variance <- apply(omega_draws, c(2, 3), var)
+
+dimnames(omega_median) <- list(country_names, country_names)
+dimnames(omega_variance) <- list(country_names, country_names)
+
+omega_plot_df <- function(mat, value_name) {
+  expand.grid(
+    country_row = country_names,
+    country_col = country_names,
+    stringsAsFactors = FALSE
+  ) |>
+    mutate(
+      value = as.vector(mat),
+      country_row = factor(country_row, levels = rev(country_names)),
+      country_col = factor(country_col, levels = country_names)
+    ) |>
+    rename(!!value_name := value)
+}
+
+plot_omega_heatmap <- function(plot_data, fill_var, title_text, midpoint = NULL) {
+  p <- ggplot(
+    plot_data,
+    aes(x = country_col, y = country_row, fill = .data[[fill_var]])
+  ) +
+    geom_tile(color = "white", linewidth = 0.4) +
+    coord_equal() +
+    labs(
+      title = title_text,
+      x = NULL,
+      y = NULL,
+      fill = fill_var
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(hjust = 1)
+    )
+
+  if (!is.null(midpoint)) {
+    p <- p + scale_fill_gradient2(
+      low = "#2166ac",
+      mid = "#f7f7f7",
+      high = "#b2182b",
+      midpoint = midpoint,
+      limits = c(-1, 1)
+    )
+  } else {
+    p <- p + scale_fill_gradient(
+      low = "#f7fbff",
+      high = "#08306b"
+    )
   }
-}
-# reconstruct by undoing the cholesky decomp: https://mc-stan.org/docs/functions-reference/distributions_over_unbounded_vectors.html#multi-normal-cholesky-fun
-Xcovmat = L_proc_mean_mat%*% t(L_proc_mean_mat)
 
-colnames(Xcovmat) = countries2use
-rownames(Xcovmat) = countries2use
-df <- melt(Xcovmat)
-colnames(df) <- c("Row", "Column", "Value")
-ggplot(df, aes(x = Column, y = Row, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Covariance between countries")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-
-diags = 1/sqrt(diag(Xcovmat))
-cormat = diag(diags)%*%Xcovmat%*% diag(diags)
-
-
-colnames(cormat) = countries2use
-rownames(cormat) = countries2use
-df <- melt(cormat)
-colnames(df) <- c("Row", "Column", "Value")
-ggplot(df, aes(x = Column, y = Row, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Correlation between countries")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-```
-
-
-
-
-
-Take a closer look at the relationship between countries.  These are the lements of $\Theta$ in the process evolution:
-
-$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
-
-```{r}
-#| cache: true
-#| code-fold: true
-meanies <- lapply(1:dim(fittedtheta)[3], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mean(fittedtheta[-c(1:burnin), , i]) 
-})
-meanies = unlist(meanies)
-names(meanies) = parnames[theta_index]
-
-
-
-
-
-Tmean_mat = matrix(0, nrow = length(countries2use), ncol =  length(countries2use))
-for(rows in 1:length(countries2use)){
-  for(cols in 1:length(countries2use)){
-    Tmean_mat[rows,cols] = meanies[paste0("theta[",rows,",",cols,"]")]
-  }
+  p
 }
 
+omega_median_df <- omega_plot_df(omega_median, "median_correlation")
+omega_variance_df <- omega_plot_df(omega_variance, "correlation_variance")
 
-colnames(Tmean_mat) = countries2use
-rownames(Tmean_mat) = countries2use
-df <- melt(Tmean_mat)
-colnames(df) <- c("Impact_on", "Lag1", "Value")
-ggplot(df, aes(x = Lag1, y = Impact_on, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Impact (Theta)")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+omega_median_plot <- plot_omega_heatmap(
+  omega_median_df,
+  fill_var = "median_correlation",
+  title_text = "Posterior median of Omega",
+  midpoint = 0
+)
 
+omega_variance_plot <- plot_omega_heatmap(
+  omega_variance_df,
+  fill_var = "correlation_variance",
+  title_text = "Posterior variance of Omega"
+)
 
+print(omega_median_plot)
+print(omega_variance_plot)
+
+output_stub <- tools::file_path_sans_ext(filename)
+omega_median_file <- paste0(output_stub, "_Omega_median.png")
+omega_variance_file <- paste0(output_stub, "_Omega_variance.png")
+
+ggsave(
+  filename = omega_median_file,
+  plot = omega_median_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  filename = omega_variance_file,
+  plot = omega_variance_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+cat("Saved Omega median image to", omega_median_file, "\n")
+cat("Saved Omega variance image to", omega_variance_file, "\n")
 ```
 
+## Save Output
 
-
-
-:::
-
-::: {.callout-note collapse=true title="Posterior distribution of states"}
-
-
-```{r}
-#| cache: true
+```{r save_output}
 #| code-fold: true
 
-
-Nsam = 1000
-Xsamples = combo_fittedX_mat[sample(1:nrow(combo_fittedX_mat), Nsam),]
-cols <- adjustcolor(hcl.colors(Nsam, palette = "viridis"), alpha.f = .1)
-for(country in 1:length(countries2use)){
-  matplot(x = dates_in_use,
-          y = t(Xsamples[,grep(colnames(Xsamples),
-                               pattern = paste0(country,"\\]"))]),
-          type = 'l',  
-          main = paste("posterior predictive fit for country",countries2use[country]),
-          ylim = c(-.1,.5), ylab = "Topic prevalence", col=cols)
-  points(x = dates_in_use[data[,country]!=0],
-         data[data[,country]!=0,country], 
-         pch = "*", cex = 3, col= "red")
-}
-
+save(
+  fit,
+  stan_data,
+  data_for_model,
+  dates_in_use,
+  country_names,
+  topic_of_interest,
+  file = filename
+)
+cat("Saved fit and data objects to", filename, "\n")
 ```
 
-
-:::
-
-```{r, cache = TRUE}
-#| echo: false
-topic_index_for_sections = topic_index_for_sections+1
-topic_of_interest = candidate_topics[topic_index_for_sections]
-candidate_files_to_load = list.files(pattern = paste0("stan_2chain_dataSS_",topic_of_interest,"_results_Canada_France_Germany_Italy_Japan_United Kingdom_United States_60000"))
-```
-
-## Topic `r topic_of_interest`
-
-
-Results loop over the topics of interest and rely on having run the above code set across different topics.
-
-```{r chunk784}
-#| code-fold: true
-runtime = filesloaded = iters_run  =  rep(NA, length(candidate_files_to_load))
-
-# clunky and lazy way to get at the number of time steps for this topic
-filename = candidate_files_to_load[1]
-load(filename)
-parnames = names(fit)
-
-# collect the names of parameters
-
-A_index             = parnames  |> grep(pattern = "^A")
-theta_index         = parnames  |> grep(pattern = "theta")
-sigma_obs_index     = parnames  |> grep(pattern = "sigma_obs")   
-sigma_proc_index    = parnames  |> grep(pattern = "sigma_proc")
-# Note that L_corr is the lower triangle cholesky decomposition of the correlation matrix so that the diagonals and upper triangle elements will be all zeros and are not sampled.
-L_corr_index = NULL
-for(rows in 2:length(A_index)){
-  for(cols in 1:(rows-1)){
-    L_corr_index = c(L_corr_index,
-                     grep(parnames , pattern = paste0("L_corr\\[",rows,",",cols)))
-  }
-}
-L_proc_index        = parnames  |> grep(pattern = "L_proc")
-lp__index           = parnames  |> grep(pattern = "lp__")
-X_index             = parnames  |> grep(pattern = "^X")
-
-# collect the sampled parameters
-# dimensions are: iterations, chains, parameters
-fittedA          = array(NA, dim = c(niter,length(candidate_files_to_load),length(A_index)))
-fittedtheta      = array(NA, dim = c(niter,length(candidate_files_to_load),length(theta_index)))
-fittedsigma_obs  = array(NA, dim = c(niter,length(candidate_files_to_load),length(sigma_obs_index)))
-fittedsigma_proc = array(NA, dim = c(niter,length(candidate_files_to_load),length(sigma_proc_index)))
-fittedLcorr      = array(NA, dim = c(niter,length(candidate_files_to_load),length(L_corr_index)))
-fittedLproc      = array(NA, dim = c(niter,length(candidate_files_to_load),length(L_proc_index)))
-fittedlp__       = array(NA, dim = c(niter,length(candidate_files_to_load),length(lp__index)))
-fittedX          = array(NA, dim = c(niter,length(candidate_files_to_load),length(X_index)))
-
-
-for(lp in 1:length(candidate_files_to_load)){
-  filename = candidate_files_to_load[lp]
-  load(filename)
-  runtime[lp]      = as.numeric(elapsed, units = "hours")
-  filesloaded[lp]  = filename 
-  iters_run[lp]    = niter
-  
-  fittedA[,lp,]          = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[A_index])
-  fittedtheta[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[theta_index])
-  fittedsigma_obs[,lp,]  = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[sigma_obs_index])
-  fittedsigma_proc[,lp,] = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[sigma_proc_index])
-  fittedLcorr[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[L_corr_index])
-  fittedLproc[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[L_proc_index])
-  fittedlp__[,lp,]       = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[lp__index])
-  fittedX[,lp,]          = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[X_index])
-  
-}
-
-```
-
-Diagnostics:
-
-Total compute time: `r round(runtime,2)` hours.
-
-As a sanity check, just make sure that all of the median log posteriors  are pretty close to each other.  If a subset are more than like 2% worse than others, consdier if they are sampling from different places and/or should be discarded.
-
-```{r}
-#| cache: true
-
-niter = 60000
-apply(fittedlp__[-c(1:burnin),,],2,median)
-
-```
-
-
-
-Consider the Gelman-Rubin Diagnostics to see if the within chain variability is similar to the between chain variability.
-
-Make a mega matrix, but also consider little pieces later for diagnostics:
-
-```{r}
-#| code-fold: true
-
-# reconstruct the mattrices to be easier to plot
-# then slap on some names
-combo_fittedA_mat           = cbind(matrix(aperm(fittedA[-c(1:burnin), , ],            c(1, 2, 3)),nrow = dim(fittedA)[1]*dim(fittedA)[2],                   ncol = dim(fittedA)[3]),          iter = rep((1+burnin):niter, dim(fittedA)[2]),         chain = rep(1:dim(fittedA)[2],           each = burnin)); colnames(combo_fittedA_mat)            = c(parnames[A_index], "iter",  "chain")
-combo_fittedtheta_mat       = cbind(matrix(aperm(fittedtheta[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedtheta)[1]*dim(fittedtheta)[2],           ncol = dim(fittedtheta)[3]),      iter = rep((1+burnin):niter, dim(fittedtheta)[2]),     chain = rep(1:dim(fittedtheta)[2],       each = burnin)); colnames(combo_fittedtheta_mat)            = c(parnames[theta_index], "iter",  "chain")
-combo_fittedsigma_obs_mat   = cbind(matrix(aperm(fittedsigma_obs[-c(1:burnin), , ],    c(1, 2   )),nrow = dim(fittedsigma_obs)[1]*dim(fittedsigma_obs)[2],   ncol = dim(fittedsigma_obs)[3]),  iter = rep((1+burnin):niter, dim(fittedsigma_obs)[2]), chain = rep(1:dim(fittedsigma_obs)[2],   each = burnin)); colnames(combo_fittedsigma_obs_mat)            = c(parnames[sigma_obs_index], "iter",  "chain")
-combo_fittedsigma_proc_mat  = cbind(matrix(aperm(fittedsigma_proc[-c(1:burnin), , ],   c(1, 2, 3)),nrow = dim(fittedsigma_proc)[1]*dim(fittedsigma_proc)[2], ncol = dim(fittedsigma_proc)[3]), iter = rep((1+burnin):niter, dim(fittedsigma_proc)[2]),chain = rep(1:dim(fittedsigma_proc)[2],  each = burnin)); colnames(combo_fittedsigma_proc_mat)            = c(parnames[sigma_proc_index], "iter",  "chain")
-combo_fittedLcorr_mat       = cbind(matrix(aperm(fittedLcorr[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedLcorr)[1]*dim(fittedLcorr)[2],           ncol = dim(fittedLcorr)[3]),      iter = rep((1+burnin):niter, dim(fittedLcorr)[2]),     chain = rep(1:dim(fittedLcorr)[2],       each = burnin)); colnames(combo_fittedLcorr_mat)            = c(parnames[L_corr_index], "iter",  "chain")
-combo_fittedLproc_mat       = cbind(matrix(aperm(fittedLproc[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedLproc)[1]*dim(fittedLproc)[2],           ncol = dim(fittedLproc)[3]),      iter = rep((1+burnin):niter, dim(fittedLproc)[2]),     chain = rep(1:dim(fittedLproc)[2],       each = burnin)); colnames(combo_fittedLproc_mat)            = c(parnames[L_proc_index], "iter",  "chain")
-combo_fittedlp___mat        = cbind(matrix(aperm(fittedlp__[-c(1:burnin), , ],         c(1, 2   )),nrow = dim(fittedlp__)[1]*dim(fittedlp__)[2],             ncol = dim(fittedlp__)[3]),       iter = rep((1+burnin):niter, dim(fittedlp__)[2]),      chain = rep(1:dim(fittedlp__)[2],        each = burnin)); colnames(combo_fittedlp___mat)            = c(parnames[lp__index], "iter",  "chain")
-combo_fittedX_mat           = cbind(matrix(aperm(fittedX[-c(1:burnin), , ],            c(1, 2, 3)),nrow = dim(fittedX)[1]*dim(fittedX)[2],                   ncol = dim(fittedX)[3]),          iter = rep((1+burnin):niter, dim(fittedX)[2]),         chain = rep(1:dim(fittedX)[2],           each = burnin)); colnames(combo_fittedX_mat)            = c(parnames[X_index], "iter",  "chain")
-```
-
-
-
-
-::: {.callout-note collapse=true title="log posterior trace"}
-```{r}
-# do some thinning to make the traceplots plots faster
-combo_fittedlp___mat[seq(1,nrow(combo_fittedlp___mat),by = 10),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .8)
-
-
-```
-
-:::
-
-
-::: {.callout-note collapse=true title="log posterior trace"}
-```{r}
-# do some thinning to make the traceplots plots faster
-combo_fittedlp___mat[seq(1,nrow(combo_fittedlp___mat),by = 10),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .8)
-
-
-```
-
-:::
-
-::: {.callout-note collapse=true title="A"}
-
-
-
-
-
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedA)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedA[-c(1:burnin),i,])
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedA_mat[seq(1,nrow(combo_fittedA_mat), by = 50),] |>
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    parameter = str_replace_all(parameter,
-                                pattern = paste0("A\\[",country),
-                                replacement = paste0("A\\[",countries2use[country])))
-}
-stacked |>   ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-
-
-
-
-# do some light thinning to make the density plots faster
-stacked = combo_fittedA_mat[seq(1,nrow(combo_fittedA_mat), by = 5),] |>
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    parameter = str_replace_all(parameter,
-                                pattern = paste0("A\\[",country),
-                                replacement = paste0("A\\[",countries2use[country])))
-}
-
-stacked|>   ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  facet_wrap(~parameter, scales = "free")
-
-
-```
-:::
-
-::: {.callout-note collapse=true title="theta"}
-
-```{r}
-
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedtheta)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedtheta[-c(1:burnin),i,])
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-
-gelman.diag(mclist)
-
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedtheta_mat[seq(1,nrow(combo_fittedtheta_mat), by = 100),] |>  
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-
-stacked |>   ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-# do some light thinning to make the density plots faster
-combo_fittedtheta_mat[seq(1,nrow(combo_fittedtheta_mat), by = 5),] |>  
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  geom_vline(xintercept = 0)+
-  facet_wrap(~parameter, scales = "free_y")
-
-
-```
-
-:::
-
-
-::: {.callout-note collapse=true title="observational noise"}
-
-The $\sigma_{\e}$ aka sigma\_obs, the observational noise:
-
-
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedsigma_obs)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedsigma_obs[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-combo_fittedsigma_obs_mat[seq(1,nrow(combo_fittedsigma_obs_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-combo_fittedsigma_obs_mat[seq(1,nrow(combo_fittedsigma_obs_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()
-
-
-
-```
-:::
-
-
-
-::: {.callout-note collapse=true title="process noise"}
-
-The $\sigma_{\delta}$ aka sigma\_proc.  These are the diagonal elements of the process noise.
-
-```{r chunk1033}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedsigma_proc)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedsigma_proc[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedsigma_proc_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    par = str_replace_all(parameter,
-                          pattern = paste0("sigma_proc\\[",country),
-                          replacement = paste0("sigma_proc\\[",countries2use[country])))
-}
-stacked |>   
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-stacked = combo_fittedsigma_proc_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    par = str_replace_all(parameter,
-                          pattern = paste0("sigma_proc\\[",country),
-                          replacement = paste0("sigma_proc\\[",countries2use[country])))
-}
-
-stacked|>   ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  facet_wrap(~parameter, scales = "free")
-
-
-
-
-```
-
-:::
-
-
-
-
-::: {.callout-note collapse=true title="process noise matrix"}
-Elements of the correlation matrix from the Cholesky factorization that is used in stan:
-
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedLcorr)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedLcorr[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-combo_fittedLcorr_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample") |>   
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  geom_hline(yintercept = 0)+
-  facet_wrap(~parameter)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-combo_fittedLcorr_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample") |>   
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  geom_vline(xintercept = 0)+
-  facet_wrap(~parameter, scales = "free")
-  
-  
-
-```
-
-
-
-
-Take a closer look at the correlation structure of the process noise.  These are the lements of $\Sigma_\delta$ in the process evolution:
-
-$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
-
-```{r}
-#| cache: true
-#| code-fold: true
-
-
-##### Just go right after L_proc.  It's lower triangle since it's used as 
-# a cholesky decomp of the full covariance (and correlation) in the normal transitions
-
-
-
-meanies <- lapply(1:dim(fittedLproc)[3], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mean(fittedLproc[-c(1:burnin), , i]) 
-})
-meanies = unlist(meanies)
-names(meanies) = parnames[L_proc_index]
-
-L_proc_mean_mat = matrix(0, nrow = length(countries2use), ncol =  length(countries2use))
-for(rows in 1:length(countries2use)){
-  for(cols in 1:(rows)){
-    L_proc_mean_mat[rows,cols] = meanies[paste0("L_proc[",rows,",",cols,"]")]
-  }
-}
-# reconstruct by undoing the cholesky decomp: https://mc-stan.org/docs/functions-reference/distributions_over_unbounded_vectors.html#multi-normal-cholesky-fun
-Xcovmat = L_proc_mean_mat%*% t(L_proc_mean_mat)
-
-colnames(Xcovmat) = countries2use
-rownames(Xcovmat) = countries2use
-df <- melt(Xcovmat)
-colnames(df) <- c("Row", "Column", "Value")
-ggplot(df, aes(x = Column, y = Row, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Covariance between countries")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-
-diags = 1/sqrt(diag(Xcovmat))
-cormat = diag(diags)%*%Xcovmat%*% diag(diags)
-
-
-colnames(cormat) = countries2use
-rownames(cormat) = countries2use
-df <- melt(cormat)
-colnames(df) <- c("Row", "Column", "Value")
-ggplot(df, aes(x = Column, y = Row, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Correlation between countries")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-```
-
-
-
-
-
-Take a closer look at the relationship between countries.  These are the lements of $\Theta$ in the process evolution:
-
-$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
-
-```{r}
-#| cache: true
-#| code-fold: true
-
-
-
-meanies <- lapply(1:dim(fittedtheta)[3], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mean(fittedtheta[-c(1:burnin), , i]) 
-})
-meanies = unlist(meanies)
-names(meanies) = parnames[theta_index]
-
-
-
-
-
-Tmean_mat = matrix(0, nrow = length(countries2use), ncol =  length(countries2use))
-for(rows in 1:length(countries2use)){
-  for(cols in 1:length(countries2use)){
-    Tmean_mat[rows,cols] = meanies[paste0("theta[",rows,",",cols,"]")]
-  }
-}
-
-
-colnames(Tmean_mat) = countries2use
-rownames(Tmean_mat) = countries2use
-df <- melt(Tmean_mat)
-colnames(df) <- c("Impact_on", "Lag1", "Value")
-ggplot(df, aes(x = Lag1, y = Impact_on, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Impact (Theta)")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-
-```
-
-
-
-
-:::
-
-
-::: {.callout-note collapse=true title="Posterior distribution of states"}
-
-
-```{r}
-#| cache: true
-#| code-fold: true
-
-Nsam = 1000
-Xsamples = combo_fittedX_mat[sample(1:nrow(combo_fittedX_mat), Nsam),]
-cols <- adjustcolor(hcl.colors(Nsam, palette = "viridis"), alpha.f = .1)
-for(country in 1:length(countries2use)){
-  matplot(x = dates_in_use,
-          y = t(Xsamples[,grep(colnames(Xsamples),
-                               pattern = paste0(country,"\\]"))]),
-          type = 'l',  
-          main = paste("posterior predictive fit for country",countries2use[country]),
-          ylim = c(-.1,.5), ylab = "Topic prevalence", col=cols)
-  points(x = dates_in_use[data[,country]!=0],
-         data[data[,country]!=0,country], 
-         pch = "*", cex = 3, col= "red")
-}
-
-```
-
-
-
-
-
-:::
-
-
-
-```{r, cache = TRUE}
-#| echo: false
-topic_index_for_sections = topic_index_for_sections+1
-topic_of_interest = candidate_topics[topic_index_for_sections]
-candidate_files_to_load = list.files(pattern = paste0("stan_2chain_dataSS_",topic_of_interest,"_results_Canada_France_Germany_Italy_Japan_United Kingdom_United States_60000"))
-```
-
-## Topic `r topic_of_interest`
-
-
-Results loop over the topics of interest and rely on having run the above code set across different topics.
-
-```{r chunk1303}
-#| code-fold: true
-runtime = filesloaded = iters_run  =  rep(NA, length(candidate_files_to_load))
-
-# clunky and lazy way to get at the number of time steps for this topic
-filename = candidate_files_to_load[1]
-load(filename)
-parnames = names(fit)
-
-# collect the names of parameters
-
-A_index             = parnames  |> grep(pattern = "^A")
-theta_index         = parnames  |> grep(pattern = "theta")
-sigma_obs_index     = parnames  |> grep(pattern = "sigma_obs")   
-sigma_proc_index    = parnames  |> grep(pattern = "sigma_proc")
-# Note that L_corr is the lower triangle cholesky decomposition of the correlation matrix so that the diagonals and upper triangle elements will be all zeros and are not sampled.
-L_corr_index = NULL
-for(rows in 2:length(A_index)){
-  for(cols in 1:(rows-1)){
-    L_corr_index = c(L_corr_index,
-                     grep(parnames , pattern = paste0("L_corr\\[",rows,",",cols)))
-  }
-}
-L_proc_index        = parnames  |> grep(pattern = "L_proc")
-lp__index           = parnames  |> grep(pattern = "lp__")
-X_index             = parnames  |> grep(pattern = "^X")
-
-# collect the sampled parameters
-# dimensions are: iterations, chains, parameters
-fittedA          = array(NA, dim = c(niter,length(candidate_files_to_load),length(A_index)))
-fittedtheta      = array(NA, dim = c(niter,length(candidate_files_to_load),length(theta_index)))
-fittedsigma_obs  = array(NA, dim = c(niter,length(candidate_files_to_load),length(sigma_obs_index)))
-fittedsigma_proc = array(NA, dim = c(niter,length(candidate_files_to_load),length(sigma_proc_index)))
-fittedLcorr      = array(NA, dim = c(niter,length(candidate_files_to_load),length(L_corr_index)))
-fittedLproc      = array(NA, dim = c(niter,length(candidate_files_to_load),length(L_proc_index)))
-fittedlp__       = array(NA, dim = c(niter,length(candidate_files_to_load),length(lp__index)))
-fittedX          = array(NA, dim = c(niter,length(candidate_files_to_load),length(X_index)))
-
-
-for(lp in 1:length(candidate_files_to_load)){
-  filename = candidate_files_to_load[lp]
-  load(filename)
-  runtime[lp]      = as.numeric(elapsed, units = "hours")
-  filesloaded[lp]  = filename 
-  iters_run[lp]    = niter
-  
-  fittedA[,lp,]          = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[A_index])
-  fittedtheta[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[theta_index])
-  fittedsigma_obs[,lp,]  = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[sigma_obs_index])
-  fittedsigma_proc[,lp,] = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[sigma_proc_index])
-  fittedLcorr[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[L_corr_index])
-  fittedLproc[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[L_proc_index])
-  fittedlp__[,lp,]       = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[lp__index])
-  fittedX[,lp,]          = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[X_index])
-  
-}
-
-```
-
-Diagnostics:
-
-Total compute time: `r round(runtime,2)` hours.
-
-As a sanity check, just make sure that all of the median log posteriors  are pretty close to each other.  If a subset are more than like 2% worse than others, consdier if they are sampling from different places and/or should be discarded.
-
-```{r}
-#| cache: true
-
-niter = 60000
-apply(fittedlp__[-c(1:burnin),,],2,median)
-
-```
-
-
-
-Consider the Gelman-Rubin Diagnostics to see if the within chain variability is similar to the between chain variability.
-
-Make a mega matrix, but also consider little pieces later for diagnostics:
-
-```{r}
-#| code-fold: true
-
-
-# reconstruct the mattrices to be easier to plot
-# then slap on some names
-combo_fittedA_mat           = cbind(matrix(aperm(fittedA[-c(1:burnin), , ],            c(1, 2, 3)),nrow = dim(fittedA)[1]*dim(fittedA)[2],                   ncol = dim(fittedA)[3]),          iter = rep((1+burnin):niter, dim(fittedA)[2]),         chain = rep(1:dim(fittedA)[2],           each = burnin)); colnames(combo_fittedA_mat)            = c(parnames[A_index], "iter",  "chain")
-combo_fittedtheta_mat       = cbind(matrix(aperm(fittedtheta[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedtheta)[1]*dim(fittedtheta)[2],           ncol = dim(fittedtheta)[3]),      iter = rep((1+burnin):niter, dim(fittedtheta)[2]),     chain = rep(1:dim(fittedtheta)[2],       each = burnin)); colnames(combo_fittedtheta_mat)            = c(parnames[theta_index], "iter",  "chain")
-combo_fittedsigma_obs_mat   = cbind(matrix(aperm(fittedsigma_obs[-c(1:burnin), , ],    c(1, 2   )),nrow = dim(fittedsigma_obs)[1]*dim(fittedsigma_obs)[2],   ncol = dim(fittedsigma_obs)[3]),  iter = rep((1+burnin):niter, dim(fittedsigma_obs)[2]), chain = rep(1:dim(fittedsigma_obs)[2],   each = burnin)); colnames(combo_fittedsigma_obs_mat)            = c(parnames[sigma_obs_index], "iter",  "chain")
-combo_fittedsigma_proc_mat  = cbind(matrix(aperm(fittedsigma_proc[-c(1:burnin), , ],   c(1, 2, 3)),nrow = dim(fittedsigma_proc)[1]*dim(fittedsigma_proc)[2], ncol = dim(fittedsigma_proc)[3]), iter = rep((1+burnin):niter, dim(fittedsigma_proc)[2]),chain = rep(1:dim(fittedsigma_proc)[2],  each = burnin)); colnames(combo_fittedsigma_proc_mat)            = c(parnames[sigma_proc_index], "iter",  "chain")
-combo_fittedLcorr_mat       = cbind(matrix(aperm(fittedLcorr[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedLcorr)[1]*dim(fittedLcorr)[2],           ncol = dim(fittedLcorr)[3]),      iter = rep((1+burnin):niter, dim(fittedLcorr)[2]),     chain = rep(1:dim(fittedLcorr)[2],       each = burnin)); colnames(combo_fittedLcorr_mat)            = c(parnames[L_corr_index], "iter",  "chain")
-combo_fittedLproc_mat       = cbind(matrix(aperm(fittedLproc[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedLproc)[1]*dim(fittedLproc)[2],           ncol = dim(fittedLproc)[3]),      iter = rep((1+burnin):niter, dim(fittedLproc)[2]),     chain = rep(1:dim(fittedLproc)[2],       each = burnin)); colnames(combo_fittedLproc_mat)            = c(parnames[L_proc_index], "iter",  "chain")
-combo_fittedlp___mat        = cbind(matrix(aperm(fittedlp__[-c(1:burnin), , ],         c(1, 2   )),nrow = dim(fittedlp__)[1]*dim(fittedlp__)[2],             ncol = dim(fittedlp__)[3]),       iter = rep((1+burnin):niter, dim(fittedlp__)[2]),      chain = rep(1:dim(fittedlp__)[2],        each = burnin)); colnames(combo_fittedlp___mat)            = c(parnames[lp__index], "iter",  "chain")
-combo_fittedX_mat           = cbind(matrix(aperm(fittedX[-c(1:burnin), , ],            c(1, 2, 3)),nrow = dim(fittedX)[1]*dim(fittedX)[2],                   ncol = dim(fittedX)[3]),          iter = rep((1+burnin):niter, dim(fittedX)[2]),         chain = rep(1:dim(fittedX)[2],           each = burnin)); colnames(combo_fittedX_mat)            = c(parnames[X_index], "iter",  "chain")
-```
-
-
-
-::: {.callout-note collapse=true title="log posterior trace"}
-```{r}
-# do some thinning to make the traceplots plots faster
-combo_fittedlp___mat[seq(1,nrow(combo_fittedlp___mat),by = 10),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .8)
-
-
-```
-
-:::
-
-::: {.callout-note collapse=true title="A"}
-
-
-
-
-
-
-
-```{r chunk1407}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedA)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedA[-c(1:burnin),i,])
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedA_mat[seq(1,nrow(combo_fittedA_mat), by = 50),] |>
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    parameter = str_replace_all(parameter,
-                                pattern = paste0("A\\[",country),
-                                replacement = paste0("A\\[",countries2use[country])))
-}
-stacked |>   ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-
-
-
-
-# do some light thinning to make the density plots faster
-stacked = combo_fittedA_mat[seq(1,nrow(combo_fittedA_mat), by = 5),] |>
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    parameter = str_replace_all(parameter,
-                                pattern = paste0("A\\[",country),
-                                replacement = paste0("A\\[",countries2use[country])))
-}
-
-stacked|>   ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  facet_wrap(~parameter, scales = "free")
-
-
-```
-:::
-
-::: {.callout-note collapse=true title="theta"}
-
-```{r}
-
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedtheta)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedtheta[-c(1:burnin),i,])
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-
-gelman.diag(mclist)
-
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedtheta_mat[seq(1,nrow(combo_fittedtheta_mat), by = 100),] |>  
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-
-stacked |>   ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-# do some light thinning to make the density plots faster
-combo_fittedtheta_mat[seq(1,nrow(combo_fittedtheta_mat), by = 5),] |>  
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  geom_vline(xintercept = 0)+
-  facet_wrap(~parameter, scales = "free_y")
-
-
-```
-
-:::
-
-
-::: {.callout-note collapse=true title="observational noise"}
-
-The $\sigma_{\e}$ aka sigma\_obs, the observational noise:
-
-
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedsigma_obs)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedsigma_obs[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-combo_fittedsigma_obs_mat[seq(1,nrow(combo_fittedsigma_obs_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-combo_fittedsigma_obs_mat[seq(1,nrow(combo_fittedsigma_obs_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()
-
-
-
-```
-:::
-
-
-
-::: {.callout-note collapse=true title="process noise"}
-
-The $\sigma_{\delta}$ aka sigma\_proc.  These are the diagonal elements of the process noise.
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedsigma_proc)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedsigma_proc[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedsigma_proc_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    par = str_replace_all(parameter,
-                          pattern = paste0("sigma_proc\\[",country),
-                          replacement = paste0("sigma_proc\\[",countries2use[country])))
-}
-stacked |>   
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-stacked = combo_fittedsigma_proc_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    par = str_replace_all(parameter,
-                          pattern = paste0("sigma_proc\\[",country),
-                          replacement = paste0("sigma_proc\\[",countries2use[country])))
-}
-
-stacked|>   ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  facet_wrap(~parameter, scales = "free")
-
-
-
-
-```
-
-:::
-
-
-
-
-::: {.callout-note collapse=true title="process noise matrix"}
-Elements of the correlation matrix from the Cholesky factorization that is used in stan:
-
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedLcorr)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedLcorr[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-combo_fittedLcorr_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample") |>   
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  geom_hline(yintercept = 0)+
-  facet_wrap(~parameter)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-combo_fittedLcorr_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample") |>   
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  geom_vline(xintercept = 0)+
-  facet_wrap(~parameter, scales = "free")
-  
-  
-
-```
-
-
-
-
-Take a closer look at the correlation structure of the process noise.  These are the lements of $\Sigma_\delta$ in the process evolution:
-
-$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
-
-```{r}
-#| cache: true
-#| code-fold: true
-
-
-##### Just go right after L_proc.  It's lower triangle since it's used as 
-# a cholesky decomp of the full covariance (and correlation) in the normal transitions
-
-
-
-meanies <- lapply(1:dim(fittedLproc)[3], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mean(fittedLproc[-c(1:burnin), , i]) 
-})
-meanies = unlist(meanies)
-names(meanies) = parnames[L_proc_index]
-
-L_proc_mean_mat = matrix(0, nrow = length(countries2use), ncol =  length(countries2use))
-for(rows in 1:length(countries2use)){
-  for(cols in 1:(rows)){
-    L_proc_mean_mat[rows,cols] = meanies[paste0("L_proc[",rows,",",cols,"]")]
-  }
-}
-# reconstruct by undoing the cholesky decomp: https://mc-stan.org/docs/functions-reference/distributions_over_unbounded_vectors.html#multi-normal-cholesky-fun
-Xcovmat = L_proc_mean_mat%*% t(L_proc_mean_mat)
-
-colnames(Xcovmat) = countries2use
-rownames(Xcovmat) = countries2use
-df <- melt(Xcovmat)
-colnames(df) <- c("Row", "Column", "Value")
-ggplot(df, aes(x = Column, y = Row, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Covariance between countries")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-
-diags = 1/sqrt(diag(Xcovmat))
-cormat = diag(diags)%*%Xcovmat%*% diag(diags)
-
-
-colnames(cormat) = countries2use
-rownames(cormat) = countries2use
-df <- melt(cormat)
-colnames(df) <- c("Row", "Column", "Value")
-ggplot(df, aes(x = Column, y = Row, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Correlation between countries")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-```
-
-
-
-
-
-Take a closer look at the relationship between countries.  These are the lements of $\Theta$ in the process evolution:
-
-$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
-
-```{r}
-#| cache: true
-#| code-fold: true
-
-
-
-meanies <- lapply(1:dim(fittedtheta)[3], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mean(fittedtheta[-c(1:burnin), , i]) 
-})
-meanies = unlist(meanies)
-names(meanies) = parnames[theta_index]
-
-
-
-
-
-Tmean_mat = matrix(0, nrow = length(countries2use), ncol =  length(countries2use))
-for(rows in 1:length(countries2use)){
-  for(cols in 1:length(countries2use)){
-    Tmean_mat[rows,cols] = meanies[paste0("theta[",rows,",",cols,"]")]
-  }
-}
-
-
-colnames(Tmean_mat) = countries2use
-rownames(Tmean_mat) = countries2use
-df <- melt(Tmean_mat)
-colnames(df) <- c("Impact_on", "Lag1", "Value")
-ggplot(df, aes(x = Lag1, y = Impact_on, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Impact (Theta)")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-
-```
-
-
-
-
-:::
-
-::: {.callout-note collapse=true title="Posterior distribution of states"}
-
-
-```{r}
-#| cache: true
-#| code-fold: true
-
-Nsam = 1000
-Xsamples = combo_fittedX_mat[sample(1:nrow(combo_fittedX_mat), Nsam),]
-cols <- adjustcolor(hcl.colors(Nsam, palette = "viridis"), alpha.f = .1)
-for(country in 1:length(countries2use)){
-  matplot(x = dates_in_use,
-          y = t(Xsamples[,grep(colnames(Xsamples),
-                               pattern = paste0(country,"\\]"))]),
-          type = 'l',  
-          main = paste("posterior predictive fit for country",countries2use[country]),
-          ylim = c(-.1,.5), ylab = "Topic prevalence", col=cols)
-  points(x = dates_in_use[data[,country]!=0],
-         data[data[,country]!=0,country], 
-         pch = "*", cex = 3, col= "red")
-}
-
-```
-
-
-
-:::
-
-
-```{r, cache = TRUE}
-#| echo: false
-topic_index_for_sections = topic_index_for_sections+1
-topic_of_interest = candidate_topics[topic_index_for_sections]
-candidate_files_to_load = list.files(pattern = paste0("stan_2chain_dataSS_",topic_of_interest,"_results_Canada_France_Germany_Italy_Japan_United Kingdom_United States_60000"))
-```
-
-## Topic `r topic_of_interest`
-
-
-Results loop over the topics of interest and rely on having run the above code set across different topics.
-
-```{r chunk1819}
-#| code-fold: true
-runtime = filesloaded = iters_run  =  rep(NA, length(candidate_files_to_load))
-
-# clunky and lazy way to get at the number of time steps for this topic
-filename = candidate_files_to_load[1]
-load(filename)
-parnames = names(fit)
-
-# collect the names of parameters
-
-A_index             = parnames  |> grep(pattern = "^A")
-theta_index         = parnames  |> grep(pattern = "theta")
-sigma_obs_index     = parnames  |> grep(pattern = "sigma_obs")   
-sigma_proc_index    = parnames  |> grep(pattern = "sigma_proc")
-# Note that L_corr is the lower triangle cholesky decomposition of the correlation matrix so that the diagonals and upper triangle elements will be all zeros and are not sampled.
-L_corr_index = NULL
-for(rows in 2:length(A_index)){
-  for(cols in 1:(rows-1)){
-    L_corr_index = c(L_corr_index,
-                     grep(parnames , pattern = paste0("L_corr\\[",rows,",",cols)))
-  }
-}
-L_proc_index        = parnames  |> grep(pattern = "L_proc")
-lp__index           = parnames  |> grep(pattern = "lp__")
-X_index             = parnames  |> grep(pattern = "^X")
-
-# collect the sampled parameters
-# dimensions are: iterations, chains, parameters
-fittedA          = array(NA, dim = c(niter,length(candidate_files_to_load),length(A_index)))
-fittedtheta      = array(NA, dim = c(niter,length(candidate_files_to_load),length(theta_index)))
-fittedsigma_obs  = array(NA, dim = c(niter,length(candidate_files_to_load),length(sigma_obs_index)))
-fittedsigma_proc = array(NA, dim = c(niter,length(candidate_files_to_load),length(sigma_proc_index)))
-fittedLcorr      = array(NA, dim = c(niter,length(candidate_files_to_load),length(L_corr_index)))
-fittedLproc      = array(NA, dim = c(niter,length(candidate_files_to_load),length(L_proc_index)))
-fittedlp__       = array(NA, dim = c(niter,length(candidate_files_to_load),length(lp__index)))
-fittedX          = array(NA, dim = c(niter,length(candidate_files_to_load),length(X_index)))
-
-
-for(lp in 1:length(candidate_files_to_load)){
-  filename = candidate_files_to_load[lp]
-  load(filename)
-  runtime[lp]      = as.numeric(elapsed, units = "hours")
-  filesloaded[lp]  = filename 
-  iters_run[lp]    = niter
-  
-  fittedA[,lp,]          = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[A_index])
-  fittedtheta[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[theta_index])
-  fittedsigma_obs[,lp,]  = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[sigma_obs_index])
-  fittedsigma_proc[,lp,] = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[sigma_proc_index])
-  fittedLcorr[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[L_corr_index])
-  fittedLproc[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[L_proc_index])
-  fittedlp__[,lp,]       = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[lp__index])
-  fittedX[,lp,]          = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[X_index])
-  
-}
-
-```
-
-Diagnostics:
-
-Total compute time: `r round(runtime,2)` hours.
-
-As a sanity check, just make sure that all of the median log posteriors  are pretty close to each other.  If a subset are more than like 2% worse than others, consdier if they are sampling from different places and/or should be discarded.
-
-```{r}
-#| cache: true
-
-niter = 60000
-apply(fittedlp__[-c(1:burnin),,],2,median)
-
-```
-
-
-
-Consider the Gelman-Rubin Diagnostics to see if the within chain variability is similar to the between chain variability.
-
-Make a mega matrix, but also consider little pieces later for diagnostics:
-
-```{r}
-#| code-fold: true
-
-
-# reconstruct the mattrices to be easier to plot
-# then slap on some names
-combo_fittedA_mat           = cbind(matrix(aperm(fittedA[-c(1:burnin), , ],            c(1, 2, 3)),nrow = dim(fittedA)[1]*dim(fittedA)[2],                   ncol = dim(fittedA)[3]),          iter = rep((1+burnin):niter, dim(fittedA)[2]),         chain = rep(1:dim(fittedA)[2],           each = burnin)); colnames(combo_fittedA_mat)            = c(parnames[A_index], "iter",  "chain")
-combo_fittedtheta_mat       = cbind(matrix(aperm(fittedtheta[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedtheta)[1]*dim(fittedtheta)[2],           ncol = dim(fittedtheta)[3]),      iter = rep((1+burnin):niter, dim(fittedtheta)[2]),     chain = rep(1:dim(fittedtheta)[2],       each = burnin)); colnames(combo_fittedtheta_mat)            = c(parnames[theta_index], "iter",  "chain")
-combo_fittedsigma_obs_mat   = cbind(matrix(aperm(fittedsigma_obs[-c(1:burnin), , ],    c(1, 2   )),nrow = dim(fittedsigma_obs)[1]*dim(fittedsigma_obs)[2],   ncol = dim(fittedsigma_obs)[3]),  iter = rep((1+burnin):niter, dim(fittedsigma_obs)[2]), chain = rep(1:dim(fittedsigma_obs)[2],   each = burnin)); colnames(combo_fittedsigma_obs_mat)            = c(parnames[sigma_obs_index], "iter",  "chain")
-combo_fittedsigma_proc_mat  = cbind(matrix(aperm(fittedsigma_proc[-c(1:burnin), , ],   c(1, 2, 3)),nrow = dim(fittedsigma_proc)[1]*dim(fittedsigma_proc)[2], ncol = dim(fittedsigma_proc)[3]), iter = rep((1+burnin):niter, dim(fittedsigma_proc)[2]),chain = rep(1:dim(fittedsigma_proc)[2],  each = burnin)); colnames(combo_fittedsigma_proc_mat)            = c(parnames[sigma_proc_index], "iter",  "chain")
-combo_fittedLcorr_mat       = cbind(matrix(aperm(fittedLcorr[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedLcorr)[1]*dim(fittedLcorr)[2],           ncol = dim(fittedLcorr)[3]),      iter = rep((1+burnin):niter, dim(fittedLcorr)[2]),     chain = rep(1:dim(fittedLcorr)[2],       each = burnin)); colnames(combo_fittedLcorr_mat)            = c(parnames[L_corr_index], "iter",  "chain")
-combo_fittedLproc_mat       = cbind(matrix(aperm(fittedLproc[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedLproc)[1]*dim(fittedLproc)[2],           ncol = dim(fittedLproc)[3]),      iter = rep((1+burnin):niter, dim(fittedLproc)[2]),     chain = rep(1:dim(fittedLproc)[2],       each = burnin)); colnames(combo_fittedLproc_mat)            = c(parnames[L_proc_index], "iter",  "chain")
-combo_fittedlp___mat        = cbind(matrix(aperm(fittedlp__[-c(1:burnin), , ],         c(1, 2   )),nrow = dim(fittedlp__)[1]*dim(fittedlp__)[2],             ncol = dim(fittedlp__)[3]),       iter = rep((1+burnin):niter, dim(fittedlp__)[2]),      chain = rep(1:dim(fittedlp__)[2],        each = burnin)); colnames(combo_fittedlp___mat)            = c(parnames[lp__index], "iter",  "chain")
-combo_fittedX_mat           = cbind(matrix(aperm(fittedX[-c(1:burnin), , ],            c(1, 2, 3)),nrow = dim(fittedX)[1]*dim(fittedX)[2],                   ncol = dim(fittedX)[3]),          iter = rep((1+burnin):niter, dim(fittedX)[2]),         chain = rep(1:dim(fittedX)[2],           each = burnin)); colnames(combo_fittedX_mat)            = c(parnames[X_index], "iter",  "chain")
-```
-
-
-
-
-::: {.callout-note collapse=true title="log posterior trace"}
-```{r}
-# do some thinning to make the traceplots plots faster
-combo_fittedlp___mat[seq(1,nrow(combo_fittedlp___mat),by = 10),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .8)
-
-
-```
-
-:::
-
-::: {.callout-note collapse=true title="A"}
-
-
-
-
-
-
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedA)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedA[-c(1:burnin),i,])
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedA_mat[seq(1,nrow(combo_fittedA_mat), by = 50),] |>
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    parameter = str_replace_all(parameter,
-                                pattern = paste0("A\\[",country),
-                                replacement = paste0("A\\[",countries2use[country])))
-}
-stacked |>   ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-
-
-
-
-# do some light thinning to make the density plots faster
-stacked = combo_fittedA_mat[seq(1,nrow(combo_fittedA_mat), by = 5),] |>
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    parameter = str_replace_all(parameter,
-                                pattern = paste0("A\\[",country),
-                                replacement = paste0("A\\[",countries2use[country])))
-}
-
-stacked|>   ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  facet_wrap(~parameter, scales = "free")
-
-
-```
-:::
-
-::: {.callout-note collapse=true title="theta"}
-
-```{r}
-
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedtheta)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedtheta[-c(1:burnin),i,])
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-
-gelman.diag(mclist)
-
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedtheta_mat[seq(1,nrow(combo_fittedtheta_mat), by = 100),] |>  
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-
-stacked |>   ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-# do some light thinning to make the density plots faster
-combo_fittedtheta_mat[seq(1,nrow(combo_fittedtheta_mat), by = 5),] |>  
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  geom_vline(xintercept = 0)+
-  facet_wrap(~parameter, scales = "free_y")
-
-
-
-```
-
-:::
-
-
-::: {.callout-note collapse=true title="observational noise"}
-
-The $\sigma_{\e}$ aka sigma\_obs, the observational noise:
-
-
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedsigma_obs)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedsigma_obs[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-combo_fittedsigma_obs_mat[seq(1,nrow(combo_fittedsigma_obs_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-combo_fittedsigma_obs_mat[seq(1,nrow(combo_fittedsigma_obs_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()
-
-
-
-```
-:::
-
-
-
-::: {.callout-note collapse=true title="process noise"}
-
-The $\sigma_{\delta}$ aka sigma\_proc.  These are the diagonal elements of the process noise.
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedsigma_proc)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedsigma_proc[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedsigma_proc_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    par = str_replace_all(parameter,
-                          pattern = paste0("sigma_proc\\[",country),
-                          replacement = paste0("sigma_proc\\[",countries2use[country])))
-}
-stacked |>   
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-stacked = combo_fittedsigma_proc_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    par = str_replace_all(parameter,
-                          pattern = paste0("sigma_proc\\[",country),
-                          replacement = paste0("sigma_proc\\[",countries2use[country])))
-}
-
-stacked|>   ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  facet_wrap(~parameter, scales = "free")
-
-
-
-
-```
-
-:::
-
-
-
-
-::: {.callout-note collapse=true title="process noise matrix"}
-Elements of the correlation matrix from the Cholesky factorization that is used in stan:
-
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedLcorr)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedLcorr[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-combo_fittedLcorr_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample") |>   
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  geom_hline(yintercept = 0)+
-  facet_wrap(~parameter)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-combo_fittedLcorr_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample") |>   
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  geom_vline(xintercept = 0)+
-  facet_wrap(~parameter, scales = "free")
-  
-  
-
-```
-
-
-
-
-Take a closer look at the correlation structure of the process noise.  These are the lements of $\Sigma_\delta$ in the process evolution:
-
-$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
-
-```{r}
-#| cache: true
-#| code-fold: true
-
-
-##### Just go right after L_proc.  It's lower triangle since it's used as 
-# a cholesky decomp of the full covariance (and correlation) in the normal transitions
-
-
-
-meanies <- lapply(1:dim(fittedLproc)[3], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mean(fittedLproc[-c(1:burnin), , i]) 
-})
-meanies = unlist(meanies)
-names(meanies) = parnames[L_proc_index]
-
-L_proc_mean_mat = matrix(0, nrow = length(countries2use), ncol =  length(countries2use))
-for(rows in 1:length(countries2use)){
-  for(cols in 1:(rows)){
-    L_proc_mean_mat[rows,cols] = meanies[paste0("L_proc[",rows,",",cols,"]")]
-  }
-}
-# reconstruct by undoing the cholesky decomp: https://mc-stan.org/docs/functions-reference/distributions_over_unbounded_vectors.html#multi-normal-cholesky-fun
-Xcovmat = L_proc_mean_mat%*% t(L_proc_mean_mat)
-
-colnames(Xcovmat) = countries2use
-rownames(Xcovmat) = countries2use
-df <- melt(Xcovmat)
-colnames(df) <- c("Row", "Column", "Value")
-ggplot(df, aes(x = Column, y = Row, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Covariance between countries")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-
-diags = 1/sqrt(diag(Xcovmat))
-cormat = diag(diags)%*%Xcovmat%*% diag(diags)
-
-
-colnames(cormat) = countries2use
-rownames(cormat) = countries2use
-df <- melt(cormat)
-colnames(df) <- c("Row", "Column", "Value")
-ggplot(df, aes(x = Column, y = Row, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Correlation between countries")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-```
-
-
-
-
-
-Take a closer look at the relationship between countries.  These are the lements of $\Theta$ in the process evolution:
-
-$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
-
-```{r}
-#| cache: true
-#| code-fold: true
-
-
-
-meanies <- lapply(1:dim(fittedtheta)[3], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mean(fittedtheta[-c(1:burnin), , i]) 
-})
-meanies = unlist(meanies)
-names(meanies) = parnames[theta_index]
-
-
-
-
-
-Tmean_mat = matrix(0, nrow = length(countries2use), ncol =  length(countries2use))
-for(rows in 1:length(countries2use)){
-  for(cols in 1:length(countries2use)){
-    Tmean_mat[rows,cols] = meanies[paste0("theta[",rows,",",cols,"]")]
-  }
-}
-
-
-colnames(Tmean_mat) = countries2use
-rownames(Tmean_mat) = countries2use
-df <- melt(Tmean_mat)
-colnames(df) <- c("Impact_on", "Lag1", "Value")
-ggplot(df, aes(x = Lag1, y = Impact_on, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Impact (Theta)")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-
-```
-
-
-
-
-:::
-
-::: {.callout-note collapse=true title="Posterior distribution of states"}
-
-
-```{r}
-#| cache: true
-#| code-fold: true
-
-Nsam = 1000
-Xsamples = combo_fittedX_mat[sample(1:nrow(combo_fittedX_mat), Nsam),]
-cols <- adjustcolor(hcl.colors(Nsam, palette = "viridis"), alpha.f = .1)
-for(country in 1:length(countries2use)){
-  matplot(x = dates_in_use,
-          y = t(Xsamples[,grep(colnames(Xsamples),
-                               pattern = paste0(country,"\\]"))]),
-          type = 'l',  
-          main = paste("posterior predictive fit for country",countries2use[country]),
-          ylim = c(-.1,.5), ylab = "Topic prevalence", col=cols)
-  points(x = dates_in_use[data[,country]!=0],
-         data[data[,country]!=0,country], 
-         pch = "*", cex = 3, col= "red")
-}
-
-```
-
-
-:::
-
-```{r, cache = TRUE}
-#| echo: false
-topic_index_for_sections = topic_index_for_sections+1
-topic_of_interest = candidate_topics[topic_index_for_sections]
-candidate_files_to_load = list.files(pattern = paste0("stan_2chain_dataSS_",topic_of_interest,"_results_Canada_France_Germany_Italy_Japan_United Kingdom_United States_60000"))
-```
-
-## Topic `r topic_of_interest`
-
-
-Results loop over the topics of interest and rely on having run the above code set across different topics.
-
-```{r chunk2334}
-#| code-fold: true
-runtime = filesloaded = iters_run  =  rep(NA, length(candidate_files_to_load))
-
-# clunky and lazy way to get at the number of time steps for this topic
-filename = candidate_files_to_load[1]
-load(filename)
-parnames = names(fit)
-
-# collect the names of parameters
-
-A_index             = parnames  |> grep(pattern = "^A")
-theta_index         = parnames  |> grep(pattern = "theta")
-sigma_obs_index     = parnames  |> grep(pattern = "sigma_obs")   
-sigma_proc_index    = parnames  |> grep(pattern = "sigma_proc")
-# Note that L_corr is the lower triangle cholesky decomposition of the correlation matrix so that the diagonals and upper triangle elements will be all zeros and are not sampled.
-L_corr_index = NULL
-for(rows in 2:length(A_index)){
-  for(cols in 1:(rows-1)){
-    L_corr_index = c(L_corr_index,
-                     grep(parnames , pattern = paste0("L_corr\\[",rows,",",cols)))
-  }
-}
-L_proc_index        = parnames  |> grep(pattern = "L_proc")
-lp__index           = parnames  |> grep(pattern = "lp__")
-X_index             = parnames  |> grep(pattern = "^X")
-
-# collect the sampled parameters
-# dimensions are: iterations, chains, parameters
-fittedA          = array(NA, dim = c(niter,length(candidate_files_to_load),length(A_index)))
-fittedtheta      = array(NA, dim = c(niter,length(candidate_files_to_load),length(theta_index)))
-fittedsigma_obs  = array(NA, dim = c(niter,length(candidate_files_to_load),length(sigma_obs_index)))
-fittedsigma_proc = array(NA, dim = c(niter,length(candidate_files_to_load),length(sigma_proc_index)))
-fittedLcorr      = array(NA, dim = c(niter,length(candidate_files_to_load),length(L_corr_index)))
-fittedLproc      = array(NA, dim = c(niter,length(candidate_files_to_load),length(L_proc_index)))
-fittedlp__       = array(NA, dim = c(niter,length(candidate_files_to_load),length(lp__index)))
-fittedX          = array(NA, dim = c(niter,length(candidate_files_to_load),length(X_index)))
-
-
-for(lp in 1:length(candidate_files_to_load)){
-  filename = candidate_files_to_load[lp]
-  load(filename)
-  runtime[lp]      = as.numeric(elapsed, units = "hours")
-  filesloaded[lp]  = filename 
-  iters_run[lp]    = niter
-  
-  fittedA[,lp,]          = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[A_index])
-  fittedtheta[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[theta_index])
-  fittedsigma_obs[,lp,]  = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[sigma_obs_index])
-  fittedsigma_proc[,lp,] = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[sigma_proc_index])
-  fittedLcorr[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[L_corr_index])
-  fittedLproc[,lp,]      = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[L_proc_index])
-  fittedlp__[,lp,]       = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[lp__index])
-  fittedX[,lp,]          = extract(fit,permuted = FALSE, inc_warmup = TRUE, pars = parnames[X_index])
-  
-}
-
-```
-
-Diagnostics:
-
-Total compute time: `r round(runtime,2)` hours.
-
-As a sanity check, just make sure that all of the median log posteriors  are pretty close to each other.  If a subset are more than like 2% worse than others, consdier if they are sampling from different places and/or should be discarded.
-
-```{r}
-#| cache: true
-
-niter = 60000
-apply(fittedlp__[-c(1:burnin),,],2,median)
-
-```
-
-
-
-Consider the Gelman-Rubin Diagnostics to see if the within chain variability is similar to the between chain variability.
-
-Make a mega matrix, but also consider little pieces later for diagnostics:
-
-```{r}
-#| code-fold: true
-
-
-# reconstruct the mattrices to be easier to plot
-# then slap on some names
-combo_fittedA_mat           = cbind(matrix(aperm(fittedA[-c(1:burnin), , ],            c(1, 2, 3)),nrow = dim(fittedA)[1]*dim(fittedA)[2],                   ncol = dim(fittedA)[3]),          iter = rep((1+burnin):niter, dim(fittedA)[2]),         chain = rep(1:dim(fittedA)[2],           each = burnin)); colnames(combo_fittedA_mat)            = c(parnames[A_index], "iter",  "chain")
-combo_fittedtheta_mat       = cbind(matrix(aperm(fittedtheta[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedtheta)[1]*dim(fittedtheta)[2],           ncol = dim(fittedtheta)[3]),      iter = rep((1+burnin):niter, dim(fittedtheta)[2]),     chain = rep(1:dim(fittedtheta)[2],       each = burnin)); colnames(combo_fittedtheta_mat)            = c(parnames[theta_index], "iter",  "chain")
-combo_fittedsigma_obs_mat   = cbind(matrix(aperm(fittedsigma_obs[-c(1:burnin), , ],    c(1, 2   )),nrow = dim(fittedsigma_obs)[1]*dim(fittedsigma_obs)[2],   ncol = dim(fittedsigma_obs)[3]),  iter = rep((1+burnin):niter, dim(fittedsigma_obs)[2]), chain = rep(1:dim(fittedsigma_obs)[2],   each = burnin)); colnames(combo_fittedsigma_obs_mat)            = c(parnames[sigma_obs_index], "iter",  "chain")
-combo_fittedsigma_proc_mat  = cbind(matrix(aperm(fittedsigma_proc[-c(1:burnin), , ],   c(1, 2, 3)),nrow = dim(fittedsigma_proc)[1]*dim(fittedsigma_proc)[2], ncol = dim(fittedsigma_proc)[3]), iter = rep((1+burnin):niter, dim(fittedsigma_proc)[2]),chain = rep(1:dim(fittedsigma_proc)[2],  each = burnin)); colnames(combo_fittedsigma_proc_mat)            = c(parnames[sigma_proc_index], "iter",  "chain")
-combo_fittedLcorr_mat       = cbind(matrix(aperm(fittedLcorr[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedLcorr)[1]*dim(fittedLcorr)[2],           ncol = dim(fittedLcorr)[3]),      iter = rep((1+burnin):niter, dim(fittedLcorr)[2]),     chain = rep(1:dim(fittedLcorr)[2],       each = burnin)); colnames(combo_fittedLcorr_mat)            = c(parnames[L_corr_index], "iter",  "chain")
-combo_fittedLproc_mat       = cbind(matrix(aperm(fittedLproc[-c(1:burnin), , ],        c(1, 2, 3)),nrow = dim(fittedLproc)[1]*dim(fittedLproc)[2],           ncol = dim(fittedLproc)[3]),      iter = rep((1+burnin):niter, dim(fittedLproc)[2]),     chain = rep(1:dim(fittedLproc)[2],       each = burnin)); colnames(combo_fittedLproc_mat)            = c(parnames[L_proc_index], "iter",  "chain")
-combo_fittedlp___mat        = cbind(matrix(aperm(fittedlp__[-c(1:burnin), , ],         c(1, 2   )),nrow = dim(fittedlp__)[1]*dim(fittedlp__)[2],             ncol = dim(fittedlp__)[3]),       iter = rep((1+burnin):niter, dim(fittedlp__)[2]),      chain = rep(1:dim(fittedlp__)[2],        each = burnin)); colnames(combo_fittedlp___mat)            = c(parnames[lp__index], "iter",  "chain")
-combo_fittedX_mat           = cbind(matrix(aperm(fittedX[-c(1:burnin), , ],            c(1, 2, 3)),nrow = dim(fittedX)[1]*dim(fittedX)[2],                   ncol = dim(fittedX)[3]),          iter = rep((1+burnin):niter, dim(fittedX)[2]),         chain = rep(1:dim(fittedX)[2],           each = burnin)); colnames(combo_fittedX_mat)            = c(parnames[X_index], "iter",  "chain")
-```
-
-
-
-
-::: {.callout-note collapse=true title="log posterior trace"}
-```{r}
-# do some thinning to make the traceplots plots faster
-combo_fittedlp___mat[seq(1,nrow(combo_fittedlp___mat),by = 10),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .8)
-
-
-```
-
-:::
-
-::: {.callout-note collapse=true title="A"}
-
-
-
-
-
-
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedA)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedA[-c(1:burnin),i,])
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedA_mat[seq(1,nrow(combo_fittedA_mat), by = 50),] |>
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    parameter = str_replace_all(parameter,
-                                pattern = paste0("A\\[",country),
-                                replacement = paste0("A\\[",countries2use[country])))
-}
-stacked |>   ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-
-
-
-
-# do some light thinning to make the density plots faster
-stacked = combo_fittedA_mat[seq(1,nrow(combo_fittedA_mat), by = 5),] |>
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    parameter = str_replace_all(parameter,
-                                pattern = paste0("A\\[",country),
-                                replacement = paste0("A\\[",countries2use[country])))
-}
-
-stacked|>   ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  facet_wrap(~parameter, scales = "free")
-
-
-
-```
-:::
-
-::: {.callout-note collapse=true title="theta"}
-
-```{r}
-
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedtheta)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedtheta[-c(1:burnin),i,])
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-
-gelman.diag(mclist)
-
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedtheta_mat[seq(1,nrow(combo_fittedtheta_mat), by = 100),] |>  
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-
-stacked |>   ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-# do some light thinning to make the density plots faster
-combo_fittedtheta_mat[seq(1,nrow(combo_fittedtheta_mat), by = 5),] |>  
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  geom_vline(xintercept = 0)+
-  facet_wrap(~parameter, scales = "free_y")
-
-
-
-```
-
-:::
-
-
-::: {.callout-note collapse=true title="observational noise"}
-
-The $\sigma_{\e}$ aka sigma\_obs, the observational noise:
-
-
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedsigma_obs)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedsigma_obs[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-combo_fittedsigma_obs_mat[seq(1,nrow(combo_fittedsigma_obs_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-combo_fittedsigma_obs_mat[seq(1,nrow(combo_fittedsigma_obs_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")|>
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()
-
-
-
-```
-:::
-
-
-
-::: {.callout-note collapse=true title="process noise"}
-
-The $\sigma_{\delta}$ aka sigma\_proc.  These are the diagonal elements of the process noise.
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedsigma_proc)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedsigma_proc[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-stacked = combo_fittedsigma_proc_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    par = str_replace_all(parameter,
-                          pattern = paste0("sigma_proc\\[",country),
-                          replacement = paste0("sigma_proc\\[",countries2use[country])))
-}
-stacked |>   
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  facet_wrap(~parameter)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-stacked = combo_fittedsigma_proc_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample")
-
-
-
-
-for(country in 1:length(countries2use)){
-  stacked = stacked|> mutate(
-    par = str_replace_all(parameter,
-                          pattern = paste0("sigma_proc\\[",country),
-                          replacement = paste0("sigma_proc\\[",countries2use[country])))
-}
-
-stacked|>   ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  facet_wrap(~parameter, scales = "free")
-
-
-
-```
-
-:::
-
-
-
-
-::: {.callout-note collapse=true title="process noise matrix"}
-Elements of the correlation matrix from the Cholesky factorization that is used in stan:
-
-
-```{r}
-
-# Create a list of mcmc objects, one for each chain
-mcmc_chains_list <- lapply(1:dim(fittedLcorr)[2], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mcmc(fittedLcorr[-c(1:burnin), i,]) 
-})
-# Combine the list of mcmc objects into an mcmc.list object
-mclist <- as.mcmc.list(mcmc_chains_list)
-gelman.diag(mclist)
-
-
-
-
-# do some heavy thinning to make the traceplots plots faster
-combo_fittedLcorr_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 100),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample") |>   
-  ggplot(aes(x = iter,y = sample, colour = as.factor(chain)))+
-  geom_line(alpha = .3)+
-  geom_hline(yintercept = 0)+
-  facet_wrap(~parameter)
-
-
-
-
-
-# do some light thinning to make the density plots faster
-combo_fittedLcorr_mat[seq(1,nrow(combo_fittedsigma_proc_mat),by = 5),] |> 
-  as_tibble()|>
-  pivot_longer(cols = -c("iter","chain"), names_to = "parameter", values_to = "sample") |>   
-  ggplot(aes(x = sample, colour = as.factor(chain)))+
-  geom_density()+
-  geom_vline(xintercept = 0)+
-  facet_wrap(~parameter, scales = "free")
-  
-  
-
-```
-
-
-
-
-Take a closer look at the correlation structure of the process noise.  These are the lements of $\Sigma_\delta$ in the process evolution:
-
-$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
-
-```{r}
-#| cache: true
-#| code-fold: true
-
-
-##### Just go right after L_proc.  It's lower triangle since it's used as 
-# a cholesky decomp of the full covariance (and correlation) in the normal transitions
-
-
-
-meanies <- lapply(1:dim(fittedLproc)[3], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mean(fittedLproc[-c(1:burnin), , i]) 
-})
-meanies = unlist(meanies)
-names(meanies) = parnames[L_proc_index]
-
-L_proc_mean_mat = matrix(0, nrow = length(countries2use), ncol =  length(countries2use))
-for(rows in 1:length(countries2use)){
-  for(cols in 1:(rows)){
-    L_proc_mean_mat[rows,cols] = meanies[paste0("L_proc[",rows,",",cols,"]")]
-  }
-}
-# reconstruct by undoing the cholesky decomp: https://mc-stan.org/docs/functions-reference/distributions_over_unbounded_vectors.html#multi-normal-cholesky-fun
-Xcovmat = L_proc_mean_mat%*% t(L_proc_mean_mat)
-
-colnames(Xcovmat) = countries2use
-rownames(Xcovmat) = countries2use
-df <- melt(Xcovmat)
-colnames(df) <- c("Row", "Column", "Value")
-ggplot(df, aes(x = Column, y = Row, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Covariance between countries")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-
-diags = 1/sqrt(diag(Xcovmat))
-cormat = diag(diags)%*%Xcovmat%*% diag(diags)
-
-
-colnames(cormat) = countries2use
-rownames(cormat) = countries2use
-df <- melt(cormat)
-colnames(df) <- c("Row", "Column", "Value")
-ggplot(df, aes(x = Column, y = Row, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Correlation between countries")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-```
-
-
-
-
-
-Take a closer look at the relationship between countries.  These are the lements of $\Theta$ in the process evolution:
-
-$$X_{t}= A+\Theta X_{t-1}+ \delta_{t}, \ \ \ where\ \ \ \delta_{t}\sim MVN(0,\Sigma_{\delta}).$$
-
-```{r}
-#| cache: true
-#| code-fold: true
-
-
-
-meanies <- lapply(1:dim(fittedtheta)[3], function(i) {
-  # Extract the i-th chain (across the second dimension)
-  # and convert it to an mcmc object
-  mean(fittedtheta[-c(1:burnin), , i]) 
-})
-meanies = unlist(meanies)
-names(meanies) = parnames[theta_index]
-
-
-
-
-
-Tmean_mat = matrix(0, nrow = length(countries2use), ncol =  length(countries2use))
-for(rows in 1:length(countries2use)){
-  for(cols in 1:length(countries2use)){
-    Tmean_mat[rows,cols] = meanies[paste0("theta[",rows,",",cols,"]")]
-  }
-}
-
-
-colnames(Tmean_mat) = countries2use
-rownames(Tmean_mat) = countries2use
-df <- melt(Tmean_mat)
-colnames(df) <- c("Impact_on", "Lag1", "Value")
-ggplot(df, aes(x = Lag1, y = Impact_on, fill = Value)) +
-  geom_tile() +
-  scale_fill_gradient(name = "Value", low = "white", high = "blue") +
-  coord_fixed() +      # Keep square tiles
-  labs(title = "Mean Process Impact (Theta)")+
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-
-```
-
-
-
-
-:::
-
-::: {.callout-note collapse=true title="Posterior distribution of states"}
-
-
-```{r}
-#| cache: true
-#| code-fold: true
-
-Nsam = 1000
-Xsamples = combo_fittedX_mat[sample(1:nrow(combo_fittedX_mat), Nsam),]
-cols <- adjustcolor(hcl.colors(Nsam, palette = "viridis"), alpha.f = .1)
-for(country in 1:length(countries2use)){
-  matplot(x = dates_in_use,
-          y = t(Xsamples[,grep(colnames(Xsamples),
-                               pattern = paste0(country,"\\]"))]),
-          type = 'l',  
-          main = paste("posterior predictive fit for country",countries2use[country]),
-          ylim = c(-.1,.5), ylab = "Topic prevalence", col=cols)
-  points(x = dates_in_use[data[,country]!=0],
-         data[data[,country]!=0,country], 
-         pch = "*", cex = 3, col= "red")
-}
-
-```
-
-
-:::
-
-::::
 
 
 ## Running this on real data:
